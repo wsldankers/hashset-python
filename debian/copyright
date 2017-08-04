@@ -1,0 +1,14 @@
+This package was created by Wessel Dankers <wsl@fruit.je> on
+Fri, 04 Aug 2017 14:10:55 +0200.
+
+It can be downloaded from http://www.fruit.je/download/fruitbak/
+Version control is at https://git.fruit.je/hashset-python
+
+Upstream Author: Wessel Dankers <wsl@fruit.je>
+
+Copyright: 2014,2017 Wessel Dankers <wsl@fruit.je>
+
+License: GPL version 3 or any later version.
+
+The Debian packaging is Copyright © 2017: Wessel Dankers <wsl@fruit.je>
+and is licensed under the GPL, see '/usr/share/common-licenses/GPL-3'.
