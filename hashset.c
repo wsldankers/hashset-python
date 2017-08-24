@@ -48,8 +48,17 @@ typedef struct hash_merge_state {
 static const hashmerge_state_t hashmerge_state_0 = {.fd = -1, .buf = MAP_FAILED};
 
 #define MERGEBUFSIZE (1 << 21)
+#define OK (!PyErr_Occurred())
+#define RETURN_IF_OK(x) return OK ? (x) : NULL
+#define RETURN_NONE_IF_OK RETURN_IF_OK((Py_INCREF(Py_None), Py_None))
 
-static uint64_t msb64(const uint8_t *bytes) {
+static uint64_t msb64(const uint8_t *bytes, size_t len) {
+	uint8_t buf[8];
+	if(len < 8) {
+		for(i = 0; i < 8; i++)
+			buf[i] = bytes[i % len];
+		bytes = buf;
+	}
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
 	return *(const uint64_t *)bytes;
 #elif __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -151,7 +160,7 @@ static bool exists_ge(const HashSet_t *hs, const void *key, size_t len, uint64_t
 	lower = 0;
 	lower_hash = 0;
 	upper_hash = UINT64_MAX;
-	target = msb64(key);
+	target = msb64(key, len);
 
 	for(;;) {
 		cur = lower_hash == upper_hash
@@ -166,10 +175,10 @@ static bool exists_ge(const HashSet_t *hs, const void *key, size_t len, uint64_t
 			break;
 		} else if(d < 0) {
 			lower = cur + 1;
-			lower_hash = msb64(cur_buf);
+			lower_hash = msb64(cur_buf, len);
 		} else {
 			upper = cur;
-			upper_hash = msb64(cur_buf);
+			upper_hash = msb64(cur_buf, len);
 		}
 		if(lower == upper)
 			break;
@@ -426,101 +435,88 @@ static int HashSetIterator_free(pTHX_ SV *sv PERL_UNUSED_DECL, MAGIC *mg) {
 	return 0;
 }
 
-MODULE = File::Hashset  PACKAGE = File::Hashset
-
-PROTOTYPES: ENABLE
-
-void
-sortfile(const char *class, const char *filename, size_t hashlen)
-PREINIT:
-	int (*cmp)(const void *, const void *);
-	HashSet_t hs = HashSet_0;
-	int *fd_ptr;
-	int err;
+PyObject *HashSet_sortfile(const char *class, const char *filename, size_t hashlen)
+	int fd;
 	struct stat st;
-PPCODE:
-	PERL_UNUSED_ARG(class);
+	HashSet_t hs = HashSet_0;
 
-	cmp = hashcmp(hashlen);
-	if(!cmp)
-		croak("File::Hashset::sortfile: unsupported hash length (%d)", hashlen);
+	if(!OK)
+		return false;
 
-	Newx(fd_ptr, 1, int);
-	SAVEDESTRUCTOR(close_fd_ptr, fd_ptr);
+	if(!hashlen)
+		return PyErr_Format(PyExc_ValueError, "HashSet.sortfile(%s): hash length must not be 0", filename), false;
 
-	*fd_ptr = open(filename, O_RDWR|O_NOCTTY|O_LARGEFILE);
-	if(*fd_ptr == -1)
-		croak("open(%s): %s", filename, strerror(errno));
+	fd = open(filename, O_RDWR|O_NOCTTY|O_LARGEFILE);
+	if(fd == -1)
+		return PyErr_SetFromErrnoWithFilename(PyExc_OsErr, filename), false;
 
-	if(fstat(*fd_ptr, &st) == -1)
-		croak("stat(%s): %s", filename, strerror(errno));
+	/* we have an open fd now, so we can't just return wantonly */
 
-	if(st.st_size % hashlen)
-		croak("File::Hashset::sortfile(%s): file size (%ld) is not a multiple of the key length (%d)", filename, (long int)st.st_size, hashlen);
+	if(fstat(fd, &st) == -1)
+		PyErr_SetFromErrnoWithFilename(PyExc_OsErr, filename);
 
-	if(st.st_size <= (off_t)hashlen)
-		return;
+	if(OK && st.st_size % hashlen)
+		PyErr_Format(PyExc_ValueError, "HashSet.sortfile(%s): file size (%ld) is not a multiple of the key length (%d)", filename, (long int)st.st_size, hashlen);
 
-	hs.buf = mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_SHARED, *fd_ptr, 0);
-	if(hs.buf == MAP_FAILED)
-		croak("mmap(%s): %s", filename, strerror(errno));
+	if(OK && st.st_size > (off_t)hashlen) {
+		hs.buf = mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+		if(hs.buf == MAP_FAILED) {
+			PyErr_SetFromErrnoWithFilename(PyExc_OsErr, filename);
+		} else {
+			hs.size = hs.mapsize = st.st_size;
+			hs.hashlen = hashlen;
+			qsort_lr(hs.buf, hs.size / hashlen, hashlen, memcmp, NULL);
+			dedup(&hs);
 
-	hs.size = hs.mapsize = st.st_size;
-	hs.hashlen = hashlen;
-	qsort(hs.buf, hs.size / hashlen, hashlen, cmp);
-	dedup(&hs);
+			if(msync(hs.buf, hs.mapsize, MS_SYNC) == -1)
+				PyErr_SetFromErrnoWithFilename(PyExc_OsErr, filename);
 
-	if(msync(hs.buf, hs.mapsize, MS_SYNC) == -1) {
-		err = errno;
-		munmap(hs.buf, hs.mapsize);
-		croak("msync(%s, MS_SYNC): %s", filename, strerror(err));
+			if(munmap(hs.buf, hs.mapsize) == -1 && OK)
+				PyErr_SetFromErrnoWithFilename(PyExc_OsErr, filename);
+
+			if(OK && hs.size != hs.mapsize && ftruncate(fd, hs.size) == -1)
+				PyErr_SetFromErrnoWithFilename(PyExc_OsErr, filename);
+		}
 	}
 
-	if(munmap(hs.buf, hs.mapsize) == -1)
-		croak("munmap(%s): %s", filename, strerror(errno));
+	if(close(fd) == -1 && OK)
+		PyErr_SetFromErrnoWithFilename(PyExc_OsErr, filename);
 
-	if(hs.size != hs.mapsize && ftruncate(*fd_ptr, hs.size) == -1)
-		croak("ftruncate(%s, %ld): %s", filename, (long int)hs.size, strerror(errno));
+	RETURN_NONE_IF_OK;
+}
 
-	err = close(*fd_ptr);
-	*fd_ptr = -1;
-	if(err == -1)
-		croak("close(%s): %s", filename, strerror(errno));
-
-	XSRETURN_EMPTY;
-
-void
-merge(const char *class, const char *destination, ...)
-PREINIT:
+PyObject *HashSet_merge(const char *class, const char *destination, ...)
 	int i;
 	HashSet_t **sources;
 	int numsources;
 	hash_merge_state_t *state;
-PPCODE:
-	PERL_UNUSED_ARG(class);
+
+	if(!OK)
+		return false;
 
 	numsources = items - 2;
 
 	//warn("merge(%s, %d)", destination, numsources);
 
-	Newx(sources, numsources, HashSet_t *);
-	SAVEFREEPV(sources);
+	sources = malloc(numsources * sizeof *sources);
+	if(sources) {
+		for(i = 0; i < numsources; i++) {
+			sources[i] = find_magic(ST(i + 2), &HashSet_vtable);
+			if(!sources[i])
+				croak("invalid File::Hashset object");
+			if(sources[i]->hashlen != sources[0]->hashlen)
+				croak("attempt to merge File::Hashset objects with differing hashlen");
+		}
 
-	for(i = 0; i < numsources; i++) {
-		sources[i] = find_magic(ST(i + 2), &HashSet_vtable);
-		if(!sources[i])
-			croak("invalid File::Hashset object");
-		if(sources[i]->hashlen != sources[0]->hashlen)
-			croak("attempt to merge File::Hashset objects with differing hashlen");
+		Newx(state, 1, hash_merge_state_t);
+		SAVEDESTRUCTOR(merge_cleanup, state);
+		*state = hash_merge_state_0;
+
+		merge_do(state, destination, sources, numsources);
 	}
 
-	Newx(state, 1, hash_merge_state_t);
-	SAVEDESTRUCTOR(merge_cleanup, state);
-	*state = hash_merge_state_0;
-
-	merge_do(state, destination, sources, numsources);
-
-	XSRETURN_EMPTY;
+	RETURN_NONE_IF_OK;
+}
 
 SV *
 new(const char *class, SV *string_sv, size_t hashlen)
@@ -548,7 +544,7 @@ CODE:
 		if(hs.buf == MAP_FAILED)
 			croak("mmap(): %s", strerror(errno));
 		memcpy(hs.buf, string, len);
-		qsort(hs.buf, len / hashlen, hashlen, cmp);
+		qsort_lr(hs.buf, len / hashlen, hashlen, cmp, NULL);
 		hs.size = hs.mapsize = len;
 		dedup(&hs);
 	}
