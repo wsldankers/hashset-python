@@ -39,6 +39,7 @@ typedef struct hash_merge_state {
 	hash_merge_source_t **queue;
 	char *buf;
 	const char *filename;
+	PyObjects *filename_obj;
 	size_t fill;
 	size_t numsources;
 	size_t queuelen;
@@ -49,7 +50,7 @@ static const hashmerge_state_t hashmerge_state_0 = {.fd = -1, .buf = MAP_FAILED}
 
 #define MERGEBUFSIZE (1 << 21)
 #define OK (!PyErr_Occurred())
-#define RETURN_IF_OK(x) return OK ? (x) : NULL
+#define RETURN_IF_OK(x) return PyErr_Occurred() ? NULL : (x)
 #define RETURN_NONE_IF_OK RETURN_IF_OK((Py_INCREF(Py_None), Py_None))
 
 static uint64_t msb64(const uint8_t *bytes, size_t len) {
@@ -401,8 +402,8 @@ static void merge_cleanup(hash_merge_state_t *state) {
 		close(state->fd);
 	if(state->buf != MAP_FAILED)
 		munmap(state->buf, MERGEBUFSIZE);
+	Py_DecRef(state->filename_obj);
 	*state = hash_merge_state_0;
-	Safefree(state);
 }
 
 static void close_fd_ptr(int *fdp) {
@@ -485,124 +486,133 @@ PyObject *HashSet_sortfile(const char *class, const char *filename, size_t hashl
 	RETURN_NONE_IF_OK;
 }
 
-PyObject *HashSet_merge(const char *class, const char *destination, ...)
+PyObject *HashSet_merge(PyObject *class, PyObject *args) {
+	hash_merge_state_t state = hash_merge_state_0;
 	int i;
-	HashSet_t **sources;
-	int numsources;
-	hash_merge_state_t *state;
 
 	if(!OK)
-		return false;
+		return NULL;
 
-	numsources = items - 2;
+	if(!PyTuple_Check(args))
+		return PyErr_SetString(PyExc_SystemError, "HashSet.merge: new style getargs format but argument is not a tuple");
 
-	//warn("merge(%s, %d)", destination, numsources);
+	state.numsources = PyTuple_GET_SIZE(args) - 1;
+	if(state.numsources < 0)
+		return PyErr_SetString(PyExc_TypeError, "HashSet.merge: needs at least 1 argument (0 given)");
 
-	sources = malloc(numsources * sizeof *sources);
-	if(sources) {
-		for(i = 0; i < numsources; i++) {
-			sources[i] = find_magic(ST(i + 2), &HashSet_vtable);
-			if(!sources[i])
-				croak("invalid File::Hashset object");
-			if(sources[i]->hashlen != sources[0]->hashlen)
-				croak("attempt to merge File::Hashset objects with differing hashlen");
+	if(!PyUnicode_FSConverter(PyTuple_GET_ITEM(args, 0), &state.filename_obj))
+		return NULL;
+
+	state.filename = PyBytes_AsString(state.filename_obj);
+	if(state.filename) {
+		state.sources = malloc(state.numsources * sizeof *state.sources);
+		if(state.sources) {
+			for(i = 0; i < state.numsources; i++) {
+				state.sources[i] = HashSet_Check(PyTuple_GET_ITEM(args, i + 1));
+				if(!state.sources[i])
+					break;
+				if(state.sources[i]->hashlen != state.sources[0]->hashlen) {
+					PyErr_SetString(PyExc_SystemError, "HashSet.merge: objects with differing hashlen (%d, %d)",
+						state.sources[0]->hashlen, state.sources[i]->hashlen);
+					break;
+				}
+			}
+
+			if(OK)
+				merge_do(&state);
+		} else {
+			PyErr_SetString(PyExc_TypeError, "HashSet.merge: out of memory");
 		}
-
-		Newx(state, 1, hash_merge_state_t);
-		SAVEDESTRUCTOR(merge_cleanup, state);
-		*state = hash_merge_state_0;
-
-		merge_do(state, destination, sources, numsources);
 	}
+
+	merge_cleanup(&state);
 
 	RETURN_NONE_IF_OK;
 }
 
-SV *
-new(const char *class, SV *string_sv, size_t hashlen)
-PREINIT:
-	HV *hash;
-	HashSet_t hs = HashSet_0;
-	const char *string;
-	STRLEN len;
-	int (*cmp)(const void *, const void *);
-CODE:
-	cmp = hashcmp(hashlen);
-	if(!cmp)
-		croak("File::Hashset::new: unsupported hash length (%d)", hashlen);
+PyObject *HashSet_new(PyTypeObject *subtype, PyObject *args, PyObject *kwds) {
+	HashSet_t *hs;
+	const char *bytes;
+	int len;
+	Py_ssize_t hashlen;
 
-	hs.hashlen = hashlen;
+	if(!OK)
+		return NULL;
 
-	if(SvUTF8(string_sv))
-		croak("attempt to use an UTF-8 string as a hash buffer");
-	string = SvPV(string_sv, len);
+	PyArg_ParseTuple(args, "y#n", &bytes, &len, &hashlen);
+
+	if(hashlen < 1)
+		return PyErr_Format(PyExc_ValueError, "HashSet.new: hash length (%z) must be larger than 0", hashlen);
+
 	if(len % hashlen)
-		croak("File::Hashset::new: string size (%ld) is not a multiple of the key length (%d)", (long int)len, hashlen);
+		return PyErr_Format(PyExc_ValueError, "HashSet.new: buffer size (%d) is not a multiple of the key length (%z)", len, hashlen);
 
-	if(len) {
-		hs.buf = mmap(NULL, (size_t)len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-		if(hs.buf == MAP_FAILED)
-			croak("mmap(): %s", strerror(errno));
-		memcpy(hs.buf, string, len);
-		qsort_lr(hs.buf, len / hashlen, hashlen, cmp, NULL);
-		hs.size = hs.mapsize = len;
-		dedup(&hs);
+	hs = PyObject_New(HashSet_t, subtype);
+	if(hs) {
+		hs->hashlen = (size_t)hashlen;
+
+		if(len) {
+			hs->buf = mmap(NULL, (size_t)len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+			if(hs->buf == MAP_FAILED) {
+				PyErr_SetFromErrno(PyExc_OsErr);
+			} else {
+				hs->size = hs->mapsize = len;
+				memcpy(hs->buf, bytes, len);
+				qsort_lr(hs->buf, len / hashlen, hashlen, memcmp, NULL);
+				dedup(hs);
+				return &hs->ob_base;
+			}
+		}
+
+		PyObject_Del(&hs->ob_base);
 	}
 
-	hash = newHV();
-	attach_magic((SV *)hash, &HashSet_vtable, "HashSet", &hs, sizeof hs);
-	RETVAL = sv_bless(newRV_noinc((SV *)hash), gv_stashpv(class, 0));
-OUTPUT:
-	RETVAL
+	return NULL;
+}
 
-SV *
-load(const char *class, const char *filename, size_t hashlen)
-PREINIT:
-	HV *hash;
-	HashSet_t hs = HashSet_0;
-	int *fd_ptr;
-	int err;
+PyObject *load(const char *class, const char *filename, size_t hashlen) {
+	HashSet_t *hs;
+	int fd;
 	struct stat st;
-CODE:
-	//warn("load(%s)", filename);
-	if(!hashcmp(hashlen))
-		croak("File::Hashset::open: unsupported hash length (%d)", hashlen);
+
+	if(!OK)
+		return NULL;
+
+	if(!hashlen)
+		croak("HashSet.open: unsupported hash length (%d)", hashlen);
 	hs.hashlen = hashlen;
 
-	Newx(fd_ptr, 1, int);
-	SAVEDESTRUCTOR(close_fd_ptr, fd_ptr);
+	fd = open(filename, O_RDONLY|O_NOCTTY|O_LARGEFILE);
+	if(fd == -1)
+		return PyErr_SetFromErrnoWithFilename(PyExc_OsErr, filename);
 
-	*fd_ptr = open(filename, O_RDONLY|O_NOCTTY|O_LARGEFILE);
-	if(*fd_ptr == -1)
-		croak("open(%s): %s", filename, strerror(errno));
+	if(fstat(fd, &st) == -1) {
+		PyErr_SetFromErrnoWithFilename(PyExc_OsErr, filename);
+	} else {
+		if(st.st_size % hashlen)
+			PyErr_Format(PyExc_ValueError, "HashSet.load(%s): file size (%d) is not a multiple of the key length (%z)", filename, (long int)st.st_size, hashlen);
 
-	if(fstat(*fd_ptr, &st) == -1)
-		croak("stat(%s): %s", filename, strerror(errno));
+		if(st.st_size) {
+			hs.buf = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, *fd_ptr, 0);
+			if(hs.buf == MAP_FAILED)
+				return PyErr_SetFromErrnoWithFilename(PyExc_OsErr, filename);
+		}
+		hs.size = hs.mapsize = st.st_size;
 
-	if(st.st_size % hashlen)
-		croak("File::Hashset::load(%s): file size (%ld) is not a multiple of the specified hashlen (%d)", filename, (long int)st.st_size, hashlen);
-
-	if(st.st_size) {
-		hs.buf = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, *fd_ptr, 0);
-		err = errno;
-		if(hs.buf == MAP_FAILED)
-			croak("mmap(%s): %s", filename, strerror(err));
+		if(st.st_size) {
+			madvise(hs.buf, hs.mapsize, MADV_WILLNEED);
+	#ifdef MADV_UNMERGEABLE
+			madvise(hs.buf, hs.mapsize, MADV_UNMERGEABLE);
+	#endif
+		}
+		hs.filename = strdup(filename);
 	}
-	hs.size = hs.mapsize = st.st_size;
 
-	if(st.st_size) {
-		madvise(hs.buf, hs.mapsize, MADV_WILLNEED);
-#ifdef MADV_UNMERGEABLE
-		madvise(hs.buf, hs.mapsize, MADV_UNMERGEABLE);
-#endif
-	}
-	hs.filename = strdup(filename);
+	if(close(fd) == -1)
+		return PyErr_SetFromErrnoWithFilename(PyExc_OsErr, filename);
 
-	hash = newHV();
-	attach_magic((SV *)hash, &HashSet_vtable, "HashSet", &hs, sizeof hs);
-	RETVAL = sv_bless(newRV_noinc((SV *)hash), gv_stashpv(class, 0));
-OUTPUT:
-	RETVAL
+	RETURN_IF_OK(hs);
+}
 
 void
 exists(SV *self, SV *key)
