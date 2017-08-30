@@ -7,6 +7,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+#define PY_SSIZE_T_CLEAN
+
 #include "Python.h"
 #include "pythread.h"
 
@@ -52,6 +54,40 @@ static const hashmerge_state_t hashmerge_state_0 = {.fd = -1, .buf = MAP_FAILED}
 #define OK (!PyErr_Occurred())
 #define RETURN_IF_OK(x) return PyErr_Occurred() ? NULL : (x)
 #define RETURN_NONE_IF_OK RETURN_IF_OK((Py_INCREF(Py_None), Py_None))
+
+static PyObject *hashset_module_filename(PyObject *filename_object) {
+	PyObject *decoded_filename;
+	if(PyUnicode_Check(filename_object)) {
+		if(PyUnicode_FSConverter(filename_object, &decoded_filename))
+			return decoded_filename;
+		else
+			return NULL;
+	} else if(PyBytes_Check(filename_object)) {
+		Py_IncRef(filename_object);
+		return filename_object;
+	} else {
+		return PyBytes_FromObject(filename_object);
+	}
+}
+
+static bool hashset_module_object_to_buffer(PyObject *obj, Py_buffer *buffer) {
+	Py_ssize_t len;
+
+	if(PyUnicode_Check(obj)) {
+		return PyErr_SetString(PyExc_BufferError, "str is not suitable for storing bytes"), false;
+	} else {
+		if(PyObject_GetBuffer(obj, buffer, PyBUF_SIMPLE) == -1)
+			return false;
+
+		if(!PyBuffer_IsContiguous(buffer, 'C')) {
+			PyBuffer_Release(buffer);
+			return PyErr_SetString(PyExc_BufferError, "buffer not contiguous"), false;
+		}
+	}
+
+	return true;
+}
+
 
 static uint64_t msb64(const uint8_t *bytes, size_t len) {
 	uint8_t buf[8];
@@ -325,11 +361,11 @@ static bool merge_do(hash_merge_state_t *state, const char *destination, HashSet
 
 	state->queue = malloc(numsources * sizeof *state->queue);
 	if(!state->queue)
-		return PyErr_NoMemory();
+		return PyErr_NoMemory(), false;
 
 	state->sources = malloc(numsources * sizeof *state->sources);
 	if(!state->sources)
-		return PyErr_NoMemory();
+		return PyErr_NoMemory(), false;
 
 	for(i = 0; i < numsources; i++)
 		state->sources[i] = hash_merge_source_0;
@@ -403,25 +439,22 @@ static void merge_cleanup(hash_merge_state_t *state) {
 	if(state->buf != MAP_FAILED)
 		munmap(state->buf, MERGEBUFSIZE);
 	Py_DecRef(state->filename_obj);
+
 	*state = hash_merge_state_0;
 }
 
-static void close_fd_ptr(int *fdp) {
-	if(*fdp != -1)
-		close(*fdp);
-	*fdp = -1;
-	Safefree(fdp);
-}
+static int HashSet_free(HashSet_t *obj) {
+	PyObject *filename;
 
-static int HashSet_free(pTHX_ SV *sv PERL_UNUSED_DECL, MAGIC *mg) {
-	HashSet_t *obj = (void *)SvPV_nolen(mg->mg_obj);
-	if(obj) {
-		if(obj->buf != MAP_FAILED)
-			munmap(obj->buf, obj->mapsize);
-		free(obj->filename);
-		*obj = HashSet_0;
-	}
-	SvREFCNT_dec(mg->mg_obj);
+	if(obj->buf != MAP_FAILED)
+		munmap(obj->buf, obj->mapsize);
+	obj->buf = MAP_FAILED;
+
+	free(obj->filename);
+	*obj->filename = NULL;
+
+	Py_CLEAR(obj->filename_obj);
+
 	return 0;
 }
 
@@ -530,16 +563,16 @@ PyObject *HashSet_merge(PyObject *class, PyObject *args) {
 	RETURN_NONE_IF_OK;
 }
 
-PyObject *HashSet_new(PyTypeObject *subtype, PyObject *args, PyObject *kwds) {
+PyObject *HashSet_new(PyTypeObject *subtype, PyObject *args, PyObject *kwargs) {
 	HashSet_t *hs;
 	const char *bytes;
-	int len;
+	Py_ssize_t len;
 	Py_ssize_t hashlen;
 
 	if(!OK)
 		return NULL;
 
-	PyArg_ParseTuple(args, "y#n", &bytes, &len, &hashlen);
+	PyArg_ParseTuple(args, "y#n:HashSet.new", &bytes, &len, &hashlen);
 
 	if(hashlen < 1)
 		return PyErr_Format(PyExc_ValueError, "HashSet.new: hash length (%z) must be larger than 0", hashlen);
@@ -570,7 +603,7 @@ PyObject *HashSet_new(PyTypeObject *subtype, PyObject *args, PyObject *kwds) {
 	return NULL;
 }
 
-PyObject *load(const char *class, const char *filename, size_t hashlen) {
+PyObject *load(PyObject *class, const char *filename, size_t hashlen) {
 	HashSet_t *hs;
 	int fd;
 	struct stat st;
@@ -611,35 +644,33 @@ PyObject *load(const char *class, const char *filename, size_t hashlen) {
 	if(close(fd) == -1)
 		return PyErr_SetFromErrnoWithFilename(PyExc_OsErr, filename);
 
-	RETURN_IF_OK(hs);
+	RETURN_IF_OK(&hs->ob_base);
 }
 
-void
-exists(SV *self, SV *key)
-PREINIT:
-	HashSet_t *hs;
-	const char *k;
-	STRLEN len;
-PPCODE:
-	hs = find_magic(self, &HashSet_vtable);
-	if(!hs)
-		croak("Invalid File::Hashset object");
+PyObject *HashSet_exists(HashSet_t *hs, PyObject *args)
+	const char *key;
+	Py_ssize_t len;
+	bool res;
 
-	k = SvPV(key, len);
-	if(HashSet_exists(hs, k, len))
-		XSRETURN_YES;
+	if(!PyArg_ParseTuple(args, "y#:HashSet.exists", &key, &len))
+		return NULL;
+
+	if(!HashSet_exists(hs, key, len, &res))
+		return NULL;
+
+	if(res)
+		Py_RETURN_TRUE;
 	else
-		XSRETURN_NO;
+		Py_RETURN_FALSE;
+}
 
-SV *
-iterator(SV *self, SV *key = NULL)
-PREINIT:
+PyObject *HashSet_iterator(HashSet_t *self, SV *key = NULL) {
 	HashSet_t *hs;
 	HashSetIterator_t c;
 	HV *hash;
 	const char *k;
 	STRLEN len;
-CODE:
+
 	hs = find_magic(self, &HashSet_vtable);
 	if(!hs)
 		croak("Invalid File::Hashset object");
@@ -659,15 +690,12 @@ CODE:
 	SvREFCNT_inc(c.HashSet);
 OUTPUT:
 	RETVAL
+}
 
-MODULE = File::Hashset  PACKAGE = File::Hashset::Cursor
-
-void
-fetch(SV *self)
-PREINIT:
+PyObject HashSetIterator_fetch(SV *self) {
 	HashSet_t *hs;
 	HashSetIterator_t *c;
-PPCODE:
+
 	c = find_magic(self, &HashSetIterator_vtable);
 	if(!c)
 		croak("invalid File::Hashset::Cursor object");
@@ -683,3 +711,4 @@ PPCODE:
 		c->off += hs->hashlen;
 		XSRETURN(1);
 	}
+}
