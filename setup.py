@@ -9,5 +9,5 @@ with open('debian/changelog') as changelog:
 setup(
 	name = name,
 	version = version,
-	ext_modules = [Extension('hashset', ['hashset.c', 'qsort.c'])],
+	ext_modules = [Extension('hashset', ['hashset.c', 'qsort_lr.c'])],
 )

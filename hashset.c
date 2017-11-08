@@ -444,8 +444,6 @@ static void merge_cleanup(hash_merge_state_t *state) {
 }
 
 static int HashSet_free(HashSet_t *obj) {
-	PyObject *filename;
-
 	if(obj->buf != MAP_FAILED)
 		munmap(obj->buf, obj->mapsize);
 	obj->buf = MAP_FAILED;
@@ -458,18 +456,13 @@ static int HashSet_free(HashSet_t *obj) {
 	return 0;
 }
 
-static int HashSetIterator_free(pTHX_ SV *sv PERL_UNUSED_DECL, MAGIC *mg) {
-	HashSetIterator_t *obj = (void *)SvPV_nolen(mg->mg_obj);
-	if(obj) {
-		if(obj->HashSet)
-			SvREFCNT_dec(obj->HashSet);
-		*obj = HashSetIterator_0;
-	}
-	SvREFCNT_dec(mg->mg_obj);
+static int HashSetIterator_free(HashSetIterator_t *obj) {
+	Py_CLEAR(obj->HashSet);
+
 	return 0;
 }
 
-PyObject *HashSet_sortfile(const char *class, const char *filename, size_t hashlen)
+PyObject *HashSet_sortfile(PyObject *class, const char *filename, size_t hashlen)
 	int fd;
 	struct stat st;
 	HashSet_t hs = HashSet_0;
