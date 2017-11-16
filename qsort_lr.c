@@ -26,26 +26,26 @@
 
 /* Byte-wise swap two items of size SIZE. */
 static inline void memswap(char *a, char *b, size_t len) {
-	size_t t;
-	if((size_t)a % sizeof t == 0 && (size_t)b % sizeof t == 0) {
-		size_t tail = len % sizeof t;
+	size_t z;
+	if((size_t)a % sizeof z == 0 && (size_t)b % sizeof z == 0) {
+		size_t tail = len % sizeof z;
 		len -= tail;
 
 		while(len) {
-			len -= sizeof t;
-			t = *(size_t *)a;
+			len -= sizeof z;
+			z = *(size_t *)a;
 			*(size_t *)a = *(size_t *)b;
-			a += sizeof t;
-			*(size_t *)b = t;
-			b += sizeof t;
+			a += sizeof z;
+			*(size_t *)b = z;
+			b += sizeof z;
 		}
 
 		len = tail;
 	}
 	while(len--) {
-		char t = *a;
+		char c = *a;
 		*a++ = *b;
-		*b++ = t;
+		*b++ = c;
 	}
 }
 
