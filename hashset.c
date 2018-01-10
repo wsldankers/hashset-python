@@ -263,16 +263,6 @@ static bool exists_ge(const Hashset_t *hs, const void *key, size_t len, uint64_t
 	return true;
 }
 
-static bool Hashset_exists(const Hashset_t *hs, const void *key, size_t len, bool *retp) {
-	uint64_t off;
-	if(!hs->size)
-		return *retp = false, true;
-	if(!exists_ge(hs, key, len, &off))
-		return false;
-	*retp = !memcmp((const char *)hs->buf + off, key, len);
-	return true;
-}
-
 static void queue_update_up(hash_merge_state_t *state, size_t i) {
 	size_t i1, i2;
 	hash_merge_source_t *s, *s1, *s2;
@@ -406,9 +396,7 @@ static bool merge_do(hash_merge_state_t *state) {
 		state->sources[i] = hash_merge_source_0;
 
 	for(i = 0; i < state->numsources; i++) {
-		hs = state->sources[i];
 		src = state->sources + i;
-		src->hs = hs;
 		src->buf = hs->buf;
 		src->end = hs->size;
 		if(src->end)
@@ -578,7 +566,7 @@ PyObject *Hashset_merge(PyObject *class, PyObject *args) {
 						break;
 					}
 				} else {
-					state.hashlen = hashlen = hs->hashlen;
+					state.hashlen = hs->hashlen;
 				}
 			}
 
@@ -603,7 +591,8 @@ PyObject *Hashset_new(PyTypeObject *subtype, PyObject *args, PyObject *kwargs) {
 	if(!OK)
 		return NULL;
 
-	PyArg_ParseTuple(args, "y#n:Hashset.new", &bytes, &len, &hashlen);
+	if(!PyArg_ParseTuple(args, "y#n:Hashset.new", &bytes, &len, &hashlen))
+		return NULL;
 
 	if(hashlen < 1)
 		return PyErr_Format(PyExc_ValueError, "Hashset.new: hash length (%z) must be larger than 0", hashlen);
@@ -622,7 +611,7 @@ PyObject *Hashset_new(PyTypeObject *subtype, PyObject *args, PyObject *kwargs) {
 			} else {
 				hs->size = hs->mapsize = len;
 				memcpy(hs->buf, bytes, len);
-				qsort_lr(hs->buf, len / hashlen, hashlen, memcmp, NULL);
+				qsort_lr(hs->buf, len / hashlen, hashlen, (qsort_lr_cmp)memcmp, NULL);
 				dedup(hs);
 				return &hs->ob_base;
 			}
@@ -636,63 +625,79 @@ PyObject *Hashset_new(PyTypeObject *subtype, PyObject *args, PyObject *kwargs) {
 
 PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs) {
 	Hashset_t *hs;
-	int fd;
+	int fd = -1;
 	struct stat st;
+	Py_ssize_t hashlen;
+	PyBytesObject *filename_obj;
+	char *filename;
 
 	if(!OK)
 		return NULL;
 
+	if(!PyArg_ParseTuple(args, "O&n:Hashset.load", PyUnicode_FSConverter, &filename_obj, &hashlen))
+		return NULL;
+
 	if(!hashlen)
-		croak("Hashset.open: unsupported hash length (%d)", hashlen);
-	hs.hashlen = hashlen;
+		PyErr_Format(PyExc_ValueError, "Hashset.open: unsupported hash length (%d)", hashlen);
 
-	fd = open(filename, O_RDONLY|O_NOCTTY|O_LARGEFILE);
-	if(fd == -1)
-		return PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+	if(OK) {
+		hs->hashlen = hashlen;
 
-	if(fstat(fd, &st) == -1) {
-		PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
-	} else {
-		if(st.st_size % hashlen)
-			PyErr_Format(PyExc_ValueError, "Hashset.load(%s): file size (%d) is not a multiple of the key length (%z)", filename, (long int)st.st_size, hashlen);
-
-		if(st.st_size) {
-			hs.buf = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, *fd_ptr, 0);
-			if(hs.buf == MAP_FAILED)
-				return PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
-		}
-		hs.size = hs.mapsize = st.st_size;
-
-		if(st.st_size) {
-			madvise(hs.buf, hs.mapsize, MADV_WILLNEED);
-	#ifdef MADV_UNMERGEABLE
-			madvise(hs.buf, hs.mapsize, MADV_UNMERGEABLE);
-	#endif
-		}
-		hs.filename = strdup(filename);
+		fd = open(filename, O_RDONLY|O_NOCTTY|O_LARGEFILE);
+		if(fd == -1)
+			PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
 	}
 
-	if(close(fd) == -1)
-		return PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+	if(OK && fstat(fd, &st) == -1)
+		PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+
+	if(OK && st.st_size % hashlen)
+		PyErr_Format(PyExc_ValueError, "Hashset.load(%s): file size (%d) is not a multiple of the key length (%z)", filename, (long int)st.st_size, hashlen);
+
+	if(OK && st.st_size) {
+		hs->buf = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+		if(hs->buf == MAP_FAILED)
+			PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+	}
+
+	if(OK) {
+		hs->size = hs->mapsize = st.st_size;
+
+		if(st.st_size) {
+			madvise(hs->buf, hs->mapsize, MADV_WILLNEED);
+#ifdef MADV_UNMERGEABLE
+			madvise(hs->buf, hs->mapsize, MADV_UNMERGEABLE);
+#endif
+		}
+		hs->filename = strdup(filename);
+	}
+
+	if(fd != -1 && close(fd) == -1)
+		PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+
+	Py_DecRef((PyObject *)filename_obj);
 
 	RETURN_IF_OK(&hs->ob_base);
 }
 
-PyObject *Hashset_exists(Hashset_t *hs, PyObject *args)
+PyObject *Hashset_exists(Hashset_t *hs, PyObject *args) {
 	const char *key;
 	Py_ssize_t len;
-	bool res;
+	uint64_t off;
 
 	if(!PyArg_ParseTuple(args, "y#:Hashset.exists", &key, &len))
 		return NULL;
 
-	if(!Hashset_exists(hs, key, len, &res))
+	if(!hs->size)
+		Py_RETURN_FALSE;
+
+	if(!exists_ge(hs, key, len, &off))
 		return NULL;
 
-	if(res)
-		Py_RETURN_TRUE;
-	else
+	if(memcmp((const char *)hs->buf + off, key, len))
 		Py_RETURN_FALSE;
+	else
+		Py_RETURN_TRUE;
 }
 
 PyObject *Hashset_iterator(Hashset_t *self, SV *key = NULL) {
