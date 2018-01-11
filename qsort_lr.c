@@ -26,18 +26,17 @@
 
 /* Byte-wise swap two items of size SIZE. */
 static inline void memswap(char *a, char *b, size_t len) {
-	size_t z;
-	if((size_t)a % sizeof z == 0 && (size_t)b % sizeof z == 0) {
-		size_t tail = len % sizeof z;
+	if((size_t)a % sizeof(size_t) == 0 && (size_t)b % sizeof(size_t) == 0) {
+		size_t tail = len % sizeof(size_t);
 		len -= tail;
 
 		while(len) {
 			len -= sizeof z;
-			z = *(size_t *)a;
+			size_t z = *(size_t *)a;
 			*(size_t *)a = *(size_t *)b;
-			a += sizeof z;
+			a += sizeof(size_t);
 			*(size_t *)b = z;
-			b += sizeof z;
+			b += sizeof(size_t);
 		}
 
 		len = tail;
@@ -59,15 +58,15 @@ typedef struct {
 	char *hi;
 } stack_node;
 
-/* The next 4 #defines implement a very fast in-line stack abstraction. */
-/* The stack needs log (total_elements) entries (we could even subtract
+/* The next four #defines implement a very fast in-line stack abstraction. */
+/* The stack needs log(total_elements) entries (we could even subtract
 	 log(MAX_THRESH)). Since total_elements has type size_t, we get as
-	 upper bound for log (total_elements):
+	 upper bound for log(total_elements):
 	 bits per byte (CHAR_BIT) * sizeof(size_t). */
 #define STACK_SIZE (CHAR_BIT * sizeof(size_t))
-#define PUSH(low, high) ((void) ((top->lo = (low)), (top->hi = (high)), ++top))
-#define POP(low, high) ((void) (--top, (low = top->lo), (high = top->hi)))
 #define STACK_NOT_EMPTY (stack < top)
+#define PUSH(low, high) do { top->lo = (low); top->hi = (high); top++ } while(0)
+#define POP(low, high) do { top--; low = top->lo; high = top->hi; } while(0)
 
 /* Order size using quicksort. This implementation incorporates
 	 four optimizations discussed in Sedgewick:
@@ -95,7 +94,7 @@ typedef struct {
 
 void qsort_lr(void *const pbase, size_t total_elems, size_t size,
 		int (*cmp)(const void *, const void *, size_t, void *), void *arg) {
-	char *base_ptr = (char *) pbase;
+	char *base_ptr = (char *)pbase;
 
 	const size_t max_thresh = MAX_THRESH * size;
 	char *const end_ptr = base_ptr + size * (total_elems - 1);
