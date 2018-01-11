@@ -66,8 +66,10 @@ typedef struct hash_merge_state {
 static const hash_merge_state_t hash_merge_state_0 = {.fd = -1, .buf = MAP_FAILED};
 
 static struct PyModuleDef hashset_module;
-static PyTypeObject Hashset_type;
-static PyTypeObject HashsetIterator_type;
+struct hashset_module_state {
+	PyTypeObject Hashset_type;
+	PyTypeObject HashsetIterator_type;
+};
 
 #define HASHSET_MAGIC UINT64_C(0xC63E9FDB3D336988)
 #define HASHSET_ITERATOR_MAGIC UINT64_C(0x2BF1D59A332EF8E5)
@@ -84,14 +86,16 @@ static PyTypeObject HashsetIterator_type;
 #define RETURN_NONE_IF_OK RETURN_IF_OK((Py_INCREF(Py_None), Py_None))
 
 static inline Hashset_t *Hashset_Check(PyObject *v) {
-	if(v && Py_TYPE(v) == &Hashset_type && ((Hashset_t *)v)->magic == HASHSET_MAGIC)
+	struct hashset_module_state *state = PyModule_GetState(PyState_FindModule(&hashset_module));
+	if(v && Py_TYPE(v) == &state->Hashset_type && ((Hashset_t *)v)->magic == HASHSET_MAGIC)
 		return (Hashset_t *)v;
 	PyErr_SetString(PyExc_SystemError, "invalid Hashset object in internal call");
 	return NULL;
 }
 
 static inline HashsetIterator_t *HashsetIterator_Check(PyObject *v) {
-	if(v && Py_TYPE(v) == &Hashset_type && ((HashsetIterator_t *)v)->magic == HASHSET_ITERATOR_MAGIC)
+	struct hashset_module_state *state = PyModule_GetState(PyState_FindModule(&hashset_module));
+	if(v && Py_TYPE(v) == &state->HashsetIterator_type && ((HashsetIterator_t *)v)->magic == HASHSET_ITERATOR_MAGIC)
 		return (HashsetIterator_t *)v;
 	PyErr_SetString(PyExc_SystemError, "invalid HashsetIterator object in internal call");
 	return NULL;
@@ -127,7 +131,6 @@ static bool hashset_module_object_to_buffer(PyObject *obj, Py_buffer *buffer) {
 
 	return true;
 }
-
 
 static uint64_t msb64(const uint8_t *bytes, size_t len) {
 	uint8_t buf[8];
@@ -641,6 +644,11 @@ PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs) {
 		PyErr_Format(PyExc_ValueError, "Hashset.open: unsupported hash length (%d)", hashlen);
 
 	if(OK) {
+		struct hashset_module_state *state = PyModule_GetState(PyState_FindModule(&hashset_module));
+		hs = PyObject_New(Hashset_t, &state->Hashset_type);
+	}
+
+	if(OK) {
 		hs->hashlen = hashlen;
 
 		fd = open(filename, O_RDONLY|O_NOCTTY|O_LARGEFILE);
@@ -675,7 +683,7 @@ PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs) {
 	if(fd != -1 && close(fd) == -1)
 		PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
 
-	Py_DecRef((PyObject *)filename_obj);
+	Py_DecRef(&filename_obj->ob_base.ob_base);
 
 	RETURN_IF_OK(&hs->ob_base);
 }
@@ -700,32 +708,30 @@ PyObject *Hashset_exists(Hashset_t *hs, PyObject *args) {
 		Py_RETURN_TRUE;
 }
 
-PyObject *Hashset_iterator(Hashset_t *self, SV *key = NULL) {
-	Hashset_t *hs;
-	HashsetIterator_t c;
-	HV *hash;
-	const char *k;
-	STRLEN len;
+PyObject *Hashset_iterator(Hashset_t *self, PyObject *args) {
+	HashsetIterator_t *c;
+	const char *key = NULL;
+	Py_ssize_t len;
+	size_t off = 0;
 
-	hs = find_magic(self, &Hashset_vtable);
-	if(!hs)
-		croak("Invalid File::Hashset object");
+	if(!PyArg_ParseTuple(args, "|y#:Hashset.exists", &key, &len))
+		return NULL;
 
-	c.Hashset = SvRV(self);
-	c.hs = hs;
-	if(key) {
-		k = SvPV(key, len);
-		c.off = exists_ge(hs, k, len);
-	} else {
-		c.off = 0;
-	}
+	if(key && !exists_ge(self, key, len, &off))
+		return NULL;
 
-	hash = newHV();
-	attach_magic((SV *)hash, &HashsetIterator_vtable, "HashsetIterator", &c, sizeof c);
-	RETVAL = sv_bless(newRV_noinc((SV *)hash), gv_stashpv("File::Hashset::Cursor", 0));
-	SvREFCNT_inc(c.Hashset);
-OUTPUT:
-	RETVAL
+	struct hashset_module_state *state = PyModule_GetState(PyState_FindModule(&hashset_module));
+	c = (HashsetIterator_t *)PyObject_New(Hashset_t, &state->HashsetIterator_type);
+	if(!c)
+		return NULL;
+
+	c->magic = HASHSET_ITERATOR_MAGIC;
+	c->hs = self;
+	c->off = off;
+
+	Py_IncRef(&self->ob_base);
+
+	return &c->ob_base;
 }
 
 static PyMethodDef Hashset_methods[] = {
@@ -738,7 +744,7 @@ static PyMethodDef Hashset_methods[] = {
 
 static PyTypeObject Hashset_type = {
     PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "hardhat.Hashset",
+    .tp_name = "hashset.Hashset",
     .tp_basicsize = sizeof(Hashset),
     .tp_dealloc = (destructor)Hashset_dealloc,
     .tp_as_mapping = &Hashset_as_mapping,
@@ -749,17 +755,17 @@ static PyTypeObject Hashset_type = {
     .tp_new = (newfunc)Hashset_new,
 };
 
-PyObject HashsetIterator_next(SV *self) {
+PyObject HashsetIterator_next(HashsetIterator_t *self) {
 	Hashset_t *hs;
 	HashsetIterator_t *c;
 
 	c = find_magic(self, &HashsetIterator_vtable);
 	if(!c)
-		croak("invalid File::Hashset::Cursor object");
+		croak("invalid File::Hashset::Iterator object");
 
 	hs = c->hs;
 	if(!hs)
-		croak("invalid File::Hashset::Cursor object");
+		croak("invalid File::Hashset::Iterator object");
 	if(c->off >= hs->size) {
 		c->off = 0;
 		XSRETURN_UNDEF;
@@ -768,4 +774,26 @@ PyObject HashsetIterator_next(SV *self) {
 		c->off += hs->hashlen;
 		XSRETURN(1);
 	}
+}
+
+static struct PyModuleDef hashset_module = {
+	PyModuleDef_HEAD_INIT,
+	.m_name = "hashset",
+	.m_doc = hashset_module_doc,
+	.m_methods = hashset_module_functions,
+	.m_size = sizeof(struct hashset_module_state),
+};
+
+PyMODINIT_FUNC PyInit_hashset(void) {
+	PyObject *module = PyModule_Create(&hashset_module);
+	if(module) {
+		struct hashset_module_state *state = PyModule_GetState(module);
+		if(PyType_Ready(&state->Hashset_type) != -1
+		&& PyModule_AddObject(module, "Hashset", &state->Hashset_type.ob_base.ob_base) != -1
+		&& PyType_Ready(&state->HashsetIterator_type) != -1
+		&& PyModule_AddObject(module, "HashsetIterator", &state->HashsetIterator_type.ob_base.ob_base) != -1)
+			return module;
+		Py_DecRef(module);
+	}
+	return NULL;
 }
