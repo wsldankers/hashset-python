@@ -31,7 +31,7 @@ static inline void memswap(char *a, char *b, size_t len) {
 		len -= tail;
 
 		while(len) {
-			len -= sizeof z;
+			len -= sizeof(size_t);
 			size_t z = *(size_t *)a;
 			*(size_t *)a = *(size_t *)b;
 			a += sizeof(size_t);
@@ -65,7 +65,7 @@ typedef struct {
 	 bits per byte (CHAR_BIT) * sizeof(size_t). */
 #define STACK_SIZE (CHAR_BIT * sizeof(size_t))
 #define STACK_NOT_EMPTY (stack < top)
-#define PUSH(low, high) do { top->lo = (low); top->hi = (high); top++ } while(0)
+#define PUSH(low, high) do { top->lo = (low); top->hi = (high); top++; } while(0)
 #define POP(low, high) do { top--; low = top->lo; high = top->hi; } while(0)
 
 /* Order size using quicksort. This implementation incorporates
