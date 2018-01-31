@@ -42,11 +42,10 @@ typedef struct HashsetIterator {
 } HashsetIterator_t;
 
 typedef struct hash_merge_source {
-	Hashset_t *hs;
-	uint64_t magic;
 	char *buf;
 	size_t off;
 	size_t end;
+	Hashset_t *hs;
 } hash_merge_source_t;
 static const hash_merge_source_t hash_merge_source_0;
 
@@ -101,6 +100,7 @@ static inline HashsetIterator_t *HashsetIterator_Check(PyObject *v) {
 	return NULL;
 }
 
+__attribute__((unused))
 static PyObject *hashset_module_filename(PyObject *filename_object) {
 	PyObject *decoded_filename;
 	if(PyUnicode_Check(filename_object)) {
@@ -116,6 +116,7 @@ static PyObject *hashset_module_filename(PyObject *filename_object) {
 	}
 }
 
+__attribute__((unused))
 static bool hashset_module_object_to_buffer(PyObject *obj, Py_buffer *buffer) {
 	if(PyUnicode_Check(obj)) {
 		return PyErr_SetString(PyExc_BufferError, "str is not suitable for storing bytes"), false;
@@ -400,6 +401,7 @@ static bool merge_do(hash_merge_state_t *state) {
 
 	for(i = 0; i < state->numsources; i++) {
 		src = state->sources + i;
+		hs = src->hs;
 		src->buf = hs->buf;
 		src->end = hs->size;
 		if(src->end)
@@ -466,7 +468,7 @@ static void merge_cleanup(hash_merge_state_t *state) {
 	*state = hash_merge_state_0;
 }
 
-static int Hashset_free(Hashset_t *obj) {
+static int Hashset_dealloc(Hashset_t *obj) {
 	if(obj->buf != MAP_FAILED)
 		munmap(obj->buf, obj->mapsize);
 	obj->buf = MAP_FAILED;
@@ -475,12 +477,6 @@ static int Hashset_free(Hashset_t *obj) {
 	obj->filename = NULL;
 
 	Py_CLEAR(obj->filename_obj);
-
-	return 0;
-}
-
-static int HashsetIterator_free(HashsetIterator_t *obj) {
-	Py_CLEAR(obj->hs);
 
 	return 0;
 }
@@ -742,45 +738,68 @@ static PyMethodDef Hashset_methods[] = {
 	{NULL}
 };
 
-static PyTypeObject Hashset_type = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "hashset.Hashset",
-    .tp_basicsize = sizeof(Hashset),
-    .tp_dealloc = (destructor)Hashset_dealloc,
-    .tp_as_mapping = &Hashset_as_mapping,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_iter = (getiterfunc)Hashset_iter,
-    .tp_methods = Hashset_methods,
-    .tp_getset = Hashset_getset,
-    .tp_new = (newfunc)Hashset_new,
+static const PyTypeObject Hashset_type = {
+	PyVarObject_HEAD_INIT(NULL, 0)
+	.tp_name = "hashset.Hashset",
+	.tp_basicsize = sizeof(Hashset_t),
+	.tp_dealloc = (destructor)Hashset_dealloc,
+//	.tp_as_mapping = &Hashset_as_mapping,
+	.tp_flags = Py_TPFLAGS_DEFAULT,
+//	.tp_iter = (getiterfunc)Hashset_iter,
+	.tp_methods = Hashset_methods,
+//	.tp_getset = Hashset_getset,
+	.tp_new = (newfunc)Hashset_new,
 };
 
-PyObject HashsetIterator_next(HashsetIterator_t *self) {
+PyObject *HashsetIterator_next(HashsetIterator_t *self) {
 	Hashset_t *hs;
-	HashsetIterator_t *c;
+	size_t off;
 
-	c = find_magic(self, &HashsetIterator_vtable);
-	if(!c)
-		croak("invalid File::Hashset::Iterator object");
-
-	hs = c->hs;
+	hs = self->hs;
 	if(!hs)
-		croak("invalid File::Hashset::Iterator object");
-	if(c->off >= hs->size) {
-		c->off = 0;
-		XSRETURN_UNDEF;
-	} else {
-		mXPUSHp((const char *)hs->buf + c->off, hs->hashlen);
-		c->off += hs->hashlen;
-		XSRETURN(1);
-	}
+		return PyErr_SetString(PyExc_TypeError, "Hashset.merge: needs at least 1 argument (0 given)"), NULL;
+
+	off = self->off;
+	if(off >= hs->size)
+		return NULL;
+
+	self->off = off + hs->hashlen;
+	return PyBytes_FromStringAndSize((const char *)hs->buf + off, hs->hashlen);
 }
+
+static int HashsetIterator_dealloc(HashsetIterator_t *obj) {
+	Py_CLEAR(obj->hs);
+
+	return 0;
+}
+
+static PyMethodDef HashsetIterator_methods[] = {
+	{"__next__", (PyCFunction)HashsetIterator_next, METH_NOARGS, "returns the next value for this iterator"},
+//	{"__enter__", (PyCFunction)HashsetIterator_enter, METH_NOARGS, "return a context manager for 'with'"},
+//	{"__exit__", (PyCFunction)HashsetIterator_exit, METH_VARARGS, "callback for 'with' context manager"},
+	{NULL}
+};
+
+static const PyTypeObject HashsetIterator_type = {
+	PyVarObject_HEAD_INIT(NULL, 0)
+	.tp_name = "hashset.HashsetIterator",
+	.tp_basicsize = sizeof(HashsetIterator_t),
+	.tp_dealloc = (destructor)HashsetIterator_dealloc,
+//	.tp_as_mapping = &Hashset_as_mapping,
+	.tp_flags = Py_TPFLAGS_DEFAULT,
+//	.tp_iter = (getiterfunc)Hashset_iter,
+	.tp_methods = HashsetIterator_methods,
+//	.tp_getset = HashsetIterator_getset,
+//	.tp_new = (newfunc)HashsetIterator_new,
+};
+
+PyDoc_STRVAR(hashset_module_doc, "Functions for querying and manipulating sorted hash files");
 
 static struct PyModuleDef hashset_module = {
 	PyModuleDef_HEAD_INIT,
 	.m_name = "hashset",
 	.m_doc = hashset_module_doc,
-	.m_methods = hashset_module_functions,
+//	.m_methods = hashset_module_functions,
 	.m_size = sizeof(struct hashset_module_state),
 };
 
@@ -788,6 +807,8 @@ PyMODINIT_FUNC PyInit_hashset(void) {
 	PyObject *module = PyModule_Create(&hashset_module);
 	if(module) {
 		struct hashset_module_state *state = PyModule_GetState(module);
+		state->Hashset_type = Hashset_type;
+		state->HashsetIterator_type = HashsetIterator_type;
 		if(PyType_Ready(&state->Hashset_type) != -1
 		&& PyModule_AddObject(module, "Hashset", &state->Hashset_type.ob_base.ob_base) != -1
 		&& PyType_Ready(&state->HashsetIterator_type) != -1
