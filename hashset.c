@@ -630,54 +630,54 @@ PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs) {
 	PyBytesObject *filename_obj;
 	char *filename;
 
-	if(!OK)
-		return NULL;
-
 	if(!PyArg_ParseTuple(args, "O&n:Hashset.load", PyUnicode_FSConverter, &filename_obj, &hashlen))
 		return NULL;
 
-	if(!hashlen)
-		PyErr_Format(PyExc_ValueError, "Hashset.open: unsupported hash length (%d)", hashlen);
-
-	if(OK) {
+	if(hashlen) {
 		struct hashset_module_state *state = PyModule_GetState(PyState_FindModule(&hashset_module));
-		hs = PyObject_New(Hashset_t, state->Hashset_type);
-	}
+		if(state) {
+			hs = PyObject_New(Hashset_t, state->Hashset_type);
+			if(hs) {
+				hs->hashlen = hashlen;
 
-	if(OK) {
-		hs->hashlen = hashlen;
+				fd = open(filename, O_RDONLY|O_NOCTTY|O_LARGEFILE);
+				if(fd != -1) {
+					if(fstat(fd, &st) != -1) {
+						if(st.st_size % hashlen == 0) {
+							hs->buf = st.st_size ? mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0) : NULL;
+							if(close(fd) != -1) {
+								if(hs->buf != MAP_FAILED) {
+									hs->size = hs->mapsize = st.st_size;
+									if(st.st_size)
+										madvise(hs->buf, hs->mapsize, MADV_WILLNEED);
 
-		fd = open(filename, O_RDONLY|O_NOCTTY|O_LARGEFILE);
-		if(fd == -1)
-			PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
-	}
-
-	if(OK && fstat(fd, &st) == -1)
-		PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
-
-	if(OK && st.st_size % hashlen)
-		PyErr_Format(PyExc_ValueError, "Hashset.load(%s): file size (%d) is not a multiple of the key length (%z)", filename, (long int)st.st_size, hashlen);
-
-	if(OK && st.st_size) {
-		hs->buf = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-		if(hs->buf == MAP_FAILED)
-			PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
-	}
-
-	if(OK) {
-		hs->size = hs->mapsize = st.st_size;
-
-		if(st.st_size) {
-			madvise(hs->buf, hs->mapsize, MADV_WILLNEED);
-#ifdef MADV_UNMERGEABLE
-			madvise(hs->buf, hs->mapsize, MADV_UNMERGEABLE);
-#endif
+									hs->filename = strdup(filename);
+									if(hs->filename)
+										return hs; FIXME
+									else
+										PyErr_NoMemory();
+								} else {
+									PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+								}
+							} else {
+								PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+							}
+						} else {
+							PyErr_Format(PyExc_ValueError, "Hashset.load(%s): file size (%d) is not a multiple of the key length (%z)", filename, (long int)st.st_size, hashlen);
+						}
+					} else {
+						PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+					}
+				} else {
+					PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+				}
+			}
+		} else {
+			PyErr_SetString(PyExc_SystemError, "internal error: unable to locate module state");
 		}
-		hs->filename = strdup(filename);
+	} else {
+		PyErr_Format(PyExc_ValueError, "Hashset.open: unsupported hash length (%d)", hashlen);
 	}
-
-	if(fd != -1 && close(fd) == -1)
-		PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
 
 	Py_DecRef(&filename_obj->ob_base.ob_base);
 
