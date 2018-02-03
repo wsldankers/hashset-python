@@ -79,6 +79,17 @@ struct hashset_module_state {
 #define HASHSET_MAGIC UINT64_C(0xC63E9FDB3D336988)
 #define HASHSET_ITERATOR_MAGIC UINT64_C(0x2BF1D59A332EF8E5)
 
+typedef struct hashset_error {
+	enum {
+		HASHSET_ERROR_NONE,
+		HASHSET_ERROR_ERRNO,
+		HASHSET_ERROR_ERRNO_WITH_FILENAME,
+		HASHSET_ERROR_HASHLEN,
+		HASHSET_ERROR_PYTHON,
+	} type:32;
+	int saved_errno;
+} hashset_error_t;
+
 #ifdef WITH_THREAD
 #define DECLARE_THREAD_SAVE PyThreadState *_save;
 #else
@@ -372,7 +383,7 @@ static bool safewrite(hash_merge_state_t *state) {
 	return true;
 }
 
-static bool merge_do(hash_merge_state_t *state) {
+static hashset_error_t merge_do(hash_merge_state_t *state) {
 	size_t i;
 	Hashset_t *hs;
 	hash_merge_source_t *src;
@@ -383,12 +394,13 @@ static bool merge_do(hash_merge_state_t *state) {
 	if(state->numsources) {
 		if(MERGEBUFSIZE % hashlen)
 			return PyErr_Format(PyExc_ValueError, "buffer length (%d) is not a multiple of hash length (%d)", (int)MERGEBUFSIZE, (int)hashlen), false;
-
+		Py_BEGIN_ALLOW_THREADS
 #ifdef MAP_HUGETLB
 		state->buf = mmap(NULL, MERGEBUFSIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
 		if(state->buf == MAP_FAILED)
 #endif
 		state->buf = mmap(NULL, MERGEBUFSIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+		Py_END_ALLOW_THREADS
 		if(state->buf == MAP_FAILED)
 			return PyErr_SetFromErrno(PyExc_OSError), false;
 	}
@@ -490,10 +502,6 @@ static int Hashset_dealloc(Hashset_t *obj) {
 	return 0;
 }
 
-#define SORTFILE_ERROR_NONE (0)
-#define SORTFILE_ERROR_HASHLEN (-32000)
-#define SORTFILE_ERROR_PYTHON (-32001)
-
 static PyObject *Hashset_sortfile(PyObject *class, PyObject *args) {
 	int fd;
 	struct stat st;
@@ -501,7 +509,7 @@ static PyObject *Hashset_sortfile(PyObject *class, PyObject *args) {
 	PyObject *filename_obj;
 	Py_ssize_t hashlen;
 	char *filename;
-	int err = SORTFILE_ERROR_NONE;
+	hashset_error_t err = {HASHSET_ERROR_NONE, 0};
 
 	if(!PyArg_ParseTuple(args, "O&n:sortfile", &filename_obj, hashset_module_filename, &hashlen))
 		return NULL;
@@ -523,68 +531,71 @@ static PyObject *Hashset_sortfile(PyObject *class, PyObject *args) {
 								dedup(&hs);
 
 								if(msync(hs.buf, hs.mapsize, MS_SYNC) == -1)
-									err = errno;
+									err = (hashset_error_t){HASHSET_ERROR_ERRNO_WITH_FILENAME, errno};
 								if(munmap(hs.buf, hs.mapsize) == -1)
-									err = errno;
-								if(err == SORTFILE_ERROR_NONE && hs.size != hs.mapsize && ftruncate(fd, hs.size) == -1)
-									err = errno;
+									err = (hashset_error_t){HASHSET_ERROR_ERRNO_WITH_FILENAME, errno};
+								if(err.type == HASHSET_ERROR_NONE && hs.size != hs.mapsize && ftruncate(fd, hs.size) == -1)
+									err = (hashset_error_t){HASHSET_ERROR_ERRNO_WITH_FILENAME, errno};
 							} else {
-								err = errno;
+								err = (hashset_error_t){HASHSET_ERROR_ERRNO_WITH_FILENAME, errno};
 							}
 						} else {
-							err = errno;
+							err = (hashset_error_t){HASHSET_ERROR_ERRNO_WITH_FILENAME, errno};
 						}
 					} else {
-						err = SORTFILE_ERROR_HASHLEN;
+						err = (hashset_error_t){HASHSET_ERROR_HASHLEN, 0};
 					}
 				} else {
-					err = errno;
+					err = (hashset_error_t){HASHSET_ERROR_ERRNO_WITH_FILENAME, errno};
 				}
-				if(close(fd) == -1 && err == SORTFILE_ERROR_NONE)
-					err = errno;
+				if(close(fd) == -1 && err.type == HASHSET_ERROR_NONE)
+					err = (hashset_error_t){HASHSET_ERROR_ERRNO_WITH_FILENAME, errno};
 			} else {
-				err = errno;
+				err = (hashset_error_t){HASHSET_ERROR_ERRNO_WITH_FILENAME, errno};
 			}
 		} else {
-			err = SORTFILE_ERROR_HASHLEN;
+			err = (hashset_error_t){HASHSET_ERROR_HASHLEN, 0};
 		}
 		Py_END_ALLOW_THREADS
-		switch(err) {
-			case SORTFILE_ERROR_NONE:
-			case SORTFILE_ERROR_PYTHON:
+		switch(err.type) {
+			case HASHSET_ERROR_NONE:
+			case HASHSET_ERROR_PYTHON:
 				break;
-			case SORTFILE_ERROR_HASHLEN:
+			case HASHSET_ERROR_HASHLEN:
 				if(hashlen)
 					PyErr_Format(PyExc_ValueError, "Hashset.sortfile(%s): file size (%ld) is not a multiple of the key length (%d)", filename, (long int)st.st_size, hashlen);
 				else
 					PyErr_Format(PyExc_ValueError, "Hashset.sortfile(%s): hash length must not be 0", filename);
-				err = SORTFILE_ERROR_PYTHON;
+				err = (hashset_error_t){HASHSET_ERROR_PYTHON, 0};
 				break;
-			default:
-				errno = err;
+			case HASHSET_ERROR_ERRNO:
+				errno = err.saved_errno;
+				PyErr_SetFromErrno(PyExc_OSError);
+				err = (hashset_error_t){HASHSET_ERROR_PYTHON, 0};
+				break;
+			case HASHSET_ERROR_ERRNO_WITH_FILENAME:
+				errno = err.saved_errno;
 				PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
-				err = SORTFILE_ERROR_PYTHON;
+				err = (hashset_error_t){HASHSET_ERROR_PYTHON, 0};
 				break;
 		}
 	} else {
-		err = SORTFILE_ERROR_PYTHON;
+		err = (hashset_error_t){HASHSET_ERROR_PYTHON, 0};
 	}
 
 	Py_DecRef(filename_obj);
 
-	if(err)
-		return NULL;
-	else
+	if(err.type == HASHSET_ERROR_NONE)
 		Py_RETURN_NONE;
+	else
+		return NULL;
 }
 
 static PyObject *Hashset_merge(PyObject *class, PyObject *args) {
 	Hashset_t *hs;
 	hash_merge_state_t state = hash_merge_state_0;
 	int i;
-
-	if(!OK)
-		return NULL;
+	hashset_error_t err = {HASHSET_ERROR_PYTHON, 0};
 
 	if(!PyTuple_Check(args))
 		return PyErr_SetString(PyExc_SystemError, "Hashset.merge: new style getargs format but argument is not a tuple"), NULL;
@@ -593,7 +604,7 @@ static PyObject *Hashset_merge(PyObject *class, PyObject *args) {
 	if(state.numsources < 0)
 		return PyErr_SetString(PyExc_TypeError, "Hashset.merge: needs at least 1 argument (0 given)"), NULL;
 
-	if(!PyUnicode_FSConverter(PyTuple_GET_ITEM(args, 0), &state.filename_obj))
+	if(!hashset_module_filename(PyTuple_GET_ITEM(args, 0), &state.filename_obj))
 		return NULL;
 
 	state.filename = PyBytes_AsString(state.filename_obj);
@@ -616,8 +627,14 @@ static PyObject *Hashset_merge(PyObject *class, PyObject *args) {
 				}
 			}
 
-			if(OK)
-				merge_do(&state);
+			if(i == state.numsources) {
+				Py_BEGIN_ALLOW_THREADS
+				err = merge_do(&state);
+				Py_END_ALLOW_THREADS
+				switch(err) {
+					case 
+				}
+			}
 		} else {
 			PyErr_SetString(PyExc_TypeError, "Hashset.merge: out of memory");
 		}
@@ -625,7 +642,10 @@ static PyObject *Hashset_merge(PyObject *class, PyObject *args) {
 
 	merge_cleanup(&state);
 
-	RETURN_NONE_IF_OK;
+	if(ok)
+		Py_RETURN_NONE;
+	else
+		return NULL;
 }
 
 PyObject *Hashset_new(PyTypeObject *subtype, PyObject *args, PyObject *kwargs) {
