@@ -14,6 +14,12 @@
 #include "Python.h"
 #include "pythread.h"
 
+#ifdef WITH_THREAD
+#define DECLARE_THREAD_SAVE PyThreadState *_save;
+#else
+#define DECLARE_THREAD_SAVE
+#endif
+
 #ifndef O_LARGEFILE
 #define O_LARGEFILE 0
 #endif
@@ -100,20 +106,23 @@ static inline HashsetIterator_t *HashsetIterator_Check(PyObject *v) {
 	return NULL;
 }
 
-__attribute__((unused))
-static PyObject *hashset_module_filename(PyObject *filename_object) {
-	PyObject *decoded_filename;
-	if(PyUnicode_Check(filename_object)) {
-		if(PyUnicode_FSConverter(filename_object, &decoded_filename))
-			return decoded_filename;
-		else
-			return NULL;
-	} else if(PyBytes_Check(filename_object)) {
-		Py_IncRef(filename_object);
-		return filename_object;
+static int hashset_module_filename(PyObject *filename_object, PyObject **dst) {
+	if(filename_object) {
+		if(PyUnicode_Check(filename_object)) {
+			return PyUnicode_FSConverter(filename_object, dst);
+		} else if(PyBytes_Check(filename_object)) {
+			Py_IncRef(filename_object);
+			*dst = filename_object;
+		} else {
+			*dst = PyBytes_FromObject(filename_object);
+		}
+	} else if(dst) {
+		Py_CLEAR(*dst);
+		return true;
 	} else {
-		return PyBytes_FromObject(filename_object);
+		return false;
 	}
+	return Py_CLEANUP_SUPPORTED;
 }
 
 __attribute__((unused))
@@ -481,57 +490,95 @@ static int Hashset_dealloc(Hashset_t *obj) {
 	return 0;
 }
 
-PyObject *Hashset_sortfile(PyObject *class, const char *filename, size_t hashlen) {
+#define SORTFILE_ERROR_NONE (0)
+#define SORTFILE_ERROR_HASHLEN (-32000)
+#define SORTFILE_ERROR_PYTHON (-32001)
+
+static PyObject *Hashset_sortfile(PyObject *class, PyObject *args) {
 	int fd;
 	struct stat st;
 	Hashset_t hs = Hashset_0;
+	PyObject *filename_obj;
+	Py_ssize_t hashlen;
+	char *filename;
+	int err = SORTFILE_ERROR_NONE;
 
-	if(!OK)
+	if(!PyArg_ParseTuple(args, "O&n:sortfile", &filename_obj, hashset_module_filename, &hashlen))
 		return NULL;
 
-	if(!hashlen)
-		return PyErr_Format(PyExc_ValueError, "Hashset.sortfile(%s): hash length must not be 0", filename), NULL;
+	filename = PyBytes_AsString(filename_obj);
+	if(filename) {
+		Py_BEGIN_ALLOW_THREADS
+		if(hashlen) {
+			fd = open(filename, O_RDWR|O_NOCTTY|O_LARGEFILE);
+			if(fd != -1) {
+				if(fstat(fd, &st) != -1) {
+					if(st.st_size % hashlen == 0) {
+						if(st.st_size) {
+							hs.buf = mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+							if(hs.buf != MAP_FAILED) {
+								hs.size = hs.mapsize = st.st_size;
+								hs.hashlen = hashlen;
+								qsort_lr(hs.buf, hs.size / hashlen, hashlen, (qsort_lr_cmp)memcmp, NULL);
+								dedup(&hs);
 
-	fd = open(filename, O_RDWR|O_NOCTTY|O_LARGEFILE);
-	if(fd == -1)
-		return PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename), NULL;
-
-	/* we have an open fd now, so we can't just return wantonly */
-
-	if(fstat(fd, &st) == -1)
-		PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
-
-	if(OK && st.st_size % hashlen)
-		PyErr_Format(PyExc_ValueError, "Hashset.sortfile(%s): file size (%ld) is not a multiple of the key length (%d)", filename, (long int)st.st_size, hashlen);
-
-	if(OK && st.st_size > (off_t)hashlen) {
-		hs.buf = mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-		if(hs.buf == MAP_FAILED) {
-			PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+								if(msync(hs.buf, hs.mapsize, MS_SYNC) == -1)
+									err = errno;
+								if(munmap(hs.buf, hs.mapsize) == -1)
+									err = errno;
+								if(err == SORTFILE_ERROR_NONE && hs.size != hs.mapsize && ftruncate(fd, hs.size) == -1)
+									err = errno;
+							} else {
+								err = errno;
+							}
+						} else {
+							err = errno;
+						}
+					} else {
+						err = SORTFILE_ERROR_HASHLEN;
+					}
+				} else {
+					err = errno;
+				}
+				if(close(fd) == -1 && err == SORTFILE_ERROR_NONE)
+					err = errno;
+			} else {
+				err = errno;
+			}
 		} else {
-			hs.size = hs.mapsize = st.st_size;
-			hs.hashlen = hashlen;
-			qsort_lr(hs.buf, hs.size / hashlen, hashlen, (qsort_lr_cmp)memcmp, NULL);
-			dedup(&hs);
-
-			if(msync(hs.buf, hs.mapsize, MS_SYNC) == -1)
-				PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
-
-			if(munmap(hs.buf, hs.mapsize) == -1 && OK)
-				PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
-
-			if(OK && hs.size != hs.mapsize && ftruncate(fd, hs.size) == -1)
-				PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+			err = SORTFILE_ERROR_HASHLEN;
 		}
+		Py_END_ALLOW_THREADS
+		switch(err) {
+			case SORTFILE_ERROR_NONE:
+			case SORTFILE_ERROR_PYTHON:
+				break;
+			case SORTFILE_ERROR_HASHLEN:
+				if(hashlen)
+					PyErr_Format(PyExc_ValueError, "Hashset.sortfile(%s): file size (%ld) is not a multiple of the key length (%d)", filename, (long int)st.st_size, hashlen);
+				else
+					PyErr_Format(PyExc_ValueError, "Hashset.sortfile(%s): hash length must not be 0", filename);
+				err = SORTFILE_ERROR_PYTHON;
+				break;
+			default:
+				errno = err;
+				PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+				err = SORTFILE_ERROR_PYTHON;
+				break;
+		}
+	} else {
+		err = SORTFILE_ERROR_PYTHON;
 	}
 
-	if(close(fd) == -1 && OK)
-		PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+	Py_DecRef(filename_obj);
 
-	RETURN_NONE_IF_OK;
+	if(err)
+		return NULL;
+	else
+		Py_RETURN_NONE;
 }
 
-PyObject *Hashset_merge(PyObject *class, PyObject *args) {
+static PyObject *Hashset_merge(PyObject *class, PyObject *args) {
 	Hashset_t *hs;
 	hash_merge_state_t state = hash_merge_state_0;
 	int i;
@@ -623,65 +670,71 @@ PyObject *Hashset_new(PyTypeObject *subtype, PyObject *args, PyObject *kwargs) {
 }
 
 PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs) {
-	Hashset_t *hs;
+	Hashset_t *hs, *ret = NULL;
 	int fd = -1;
 	struct stat st;
 	Py_ssize_t hashlen;
-	PyBytesObject *filename_obj;
+	PyObject *filename_obj;
 	char *filename;
 
-	if(!PyArg_ParseTuple(args, "O&n:Hashset.load", PyUnicode_FSConverter, &filename_obj, &hashlen))
+	if(!PyArg_ParseTuple(args, "O&n:Hashset.load", &filename_obj, hashset_module_filename, &hashlen))
 		return NULL;
 
-	if(hashlen) {
-		struct hashset_module_state *state = PyModule_GetState(PyState_FindModule(&hashset_module));
-		if(state) {
-			hs = PyObject_New(Hashset_t, state->Hashset_type);
-			if(hs) {
-				hs->hashlen = hashlen;
+	filename = PyBytes_AsString(filename_obj);
+	if(filename) {
+		if(hashlen) {
+			struct hashset_module_state *state = PyModule_GetState(PyState_FindModule(&hashset_module));
+			if(state) {
+				hs = PyObject_New(Hashset_t, state->Hashset_type);
+				if(hs) {
+					hs->hashlen = hashlen;
 
-				fd = open(filename, O_RDONLY|O_NOCTTY|O_LARGEFILE);
-				if(fd != -1) {
-					if(fstat(fd, &st) != -1) {
-						if(st.st_size % hashlen == 0) {
-							hs->buf = st.st_size ? mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0) : NULL;
-							if(close(fd) != -1) {
-								if(hs->buf != MAP_FAILED) {
-									hs->size = hs->mapsize = st.st_size;
-									if(st.st_size)
-										madvise(hs->buf, hs->mapsize, MADV_WILLNEED);
+					fd = open(filename, O_RDONLY|O_NOCTTY|O_LARGEFILE);
+					if(fd != -1) {
+						if(fstat(fd, &st) != -1) {
+							if(st.st_size % hashlen == 0) {
+								hs->buf = st.st_size ? mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0) : NULL;
+								if(close(fd) != -1) {
+									if(hs->buf != MAP_FAILED) {
+										hs->size = hs->mapsize = st.st_size;
+										if(st.st_size)
+											madvise(hs->buf, hs->mapsize, MADV_WILLNEED);
 
-									hs->filename = strdup(filename);
-									if(hs->filename)
-										return hs; FIXME
-									else
-										PyErr_NoMemory();
+										hs->filename = strdup(filename);
+										if(hs->filename) {
+											ret = hs;
+											hs = NULL;
+										} else {
+											PyErr_NoMemory();
+										}
+									} else {
+										PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+									}
 								} else {
 									PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
 								}
 							} else {
-								PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+								PyErr_Format(PyExc_ValueError, "Hashset.load(%s): file size (%d) is not a multiple of the key length (%z)", filename, (long int)st.st_size, hashlen);
 							}
 						} else {
-							PyErr_Format(PyExc_ValueError, "Hashset.load(%s): file size (%d) is not a multiple of the key length (%z)", filename, (long int)st.st_size, hashlen);
+							PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
 						}
 					} else {
 						PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
 					}
-				} else {
-					PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
+					Py_DecRef(&hs->ob_base);
 				}
+			} else {
+				PyErr_SetString(PyExc_SystemError, "internal error: unable to locate module state");
 			}
 		} else {
-			PyErr_SetString(PyExc_SystemError, "internal error: unable to locate module state");
+			PyErr_Format(PyExc_ValueError, "Hashset.open: unsupported hash length (%d)", hashlen);
 		}
-	} else {
-		PyErr_Format(PyExc_ValueError, "Hashset.open: unsupported hash length (%d)", hashlen);
 	}
 
-	Py_DecRef(&filename_obj->ob_base.ob_base);
+	Py_DecRef(filename_obj);
 
-	RETURN_IF_OK(&hs->ob_base);
+	return &ret->ob_base;
 }
 
 PyObject *Hashset_exists(Hashset_t *hs, PyObject *args) {
@@ -733,6 +786,8 @@ PyObject *Hashset_iterator(Hashset_t *self, PyObject *args) {
 static PyMethodDef Hashset_methods[] = {
 	{"exists", (PyCFunction)Hashset_exists, METH_O, "test if this key is contained in the Hashset"},
 	{"__iter__", (PyCFunction)Hashset_iterator, METH_NOARGS, "returns an iterator for this hashet"},
+	{"sortfile", Hashset_sortfile, METH_VARARGS|METH_STATIC, "sort the hashes in a file"},
+	{"merge", Hashset_merge, METH_VARARGS|METH_STATIC, "merge Hashsets into a file"},
 //	{"__enter__", (PyCFunction)Hashset_enter, METH_NOARGS, "return a context manager for 'with'"},
 //	{"__exit__", (PyCFunction)Hashset_exit, METH_VARARGS, "callback for 'with' context manager"},
 	{NULL}
@@ -815,7 +870,6 @@ static struct PyModuleDef hashset_module = {
 	PyModuleDef_HEAD_INIT,
 	.m_name = "hashset",
 	.m_doc = hashset_module_doc,
-//	.m_methods = hashset_module_functions,
 	.m_size = sizeof(struct hashset_module_state),
 	.m_free = (freefunc)hashset_module_free,
 };
