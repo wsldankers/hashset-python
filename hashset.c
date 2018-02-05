@@ -725,7 +725,7 @@ PyObject *Hashset_new(PyTypeObject *subtype, PyObject *args, PyObject *kwargs) {
 }
 
 PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs) {
-	Hashset_t *hs;
+	Hashset_t *hs = NULL;
 	int fd = -1;
 	struct stat st;
 	Py_ssize_t hashlen;
@@ -751,13 +751,12 @@ PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs) {
 						if(fstat(fd, &st) != -1) {
 							if(st.st_size % hashlen == 0) {
 								hs->buf = st.st_size ? mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0) : NULL;
-								hashset_record_errno(&err, errno);
-								if(close(fd) != -1) {
-									hashset_clear_error(&err);
-									if(hs->buf != MAP_FAILED) {
-										hs->size = hs->mapsize = st.st_size;
+								if(hs->buf != MAP_FAILED) {
+									hs->mapsize = hs->size = st.st_size;
+									if(close(fd) != -1) {
+										hashset_clear_error(&err);
 										if(st.st_size)
-											madvise(hs->buf, hs->mapsize, MADV_WILLNEED);
+											madvise(hs->buf, st.st_size, MADV_WILLNEED);
 
 										hs->filename = strdup(filename);
 										if(!hs->filename)
@@ -765,6 +764,7 @@ PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs) {
 									} else {
 										hashset_record_errno(&err, errno);
 									}
+									fd = -1;
 								} else {
 									hashset_record_errno(&err, errno);
 								}
@@ -774,15 +774,19 @@ PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs) {
 						} else {
 							hashset_record_errno(&err, errno);
 						}
+						if(fd != -1)
+							close(fd);
 					} else {
 						hashset_record_errno(&err, errno);
 					}
 					Py_END_ALLOW_THREADS
 
-					Py_DecRef(&hs->ob_base);
+					if(err.type != HASHSET_ERROR_NONE) {
+						Py_DecRef(&hs->ob_base);
 
-					err.filename = filename;
-					hashset_error_to_python("load", &err);
+						err.filename = filename;
+						hashset_error_to_python("load", &err);
+					}
 				}
 			} else {
 				PyErr_SetString(PyExc_SystemError, "internal error: unable to locate module state");
@@ -803,7 +807,7 @@ PyObject *Hashset_exists(Hashset_t *hs, PyObject *args) {
 	const char *key;
 	Py_ssize_t len;
 	uint64_t off;
-	hashset_error_t err;
+	hashset_error_t err = hashset_error_0;
 
 	if(!PyArg_ParseTuple(args, "y#:Hashset.exists", &key, &len))
 		return NULL;
@@ -812,11 +816,11 @@ PyObject *Hashset_exists(Hashset_t *hs, PyObject *args) {
 		Py_RETURN_FALSE;
 
 	Py_BEGIN_ALLOW_THREADS
-	err = exists_ge(hs, key, len, &off);
+	off = exists_ge(hs, key, len, &err);
 	Py_END_ALLOW_THREADS
 
 	if(err.type != HASHSET_ERROR_NONE) {
-		hashset_error_to_python("exists", err, hs->filename, len, hs->hashlen);
+		hashset_error_to_python("exists", &err);
 		return NULL;
 	}
 
@@ -831,17 +835,18 @@ PyObject *Hashset_iterator(Hashset_t *self, PyObject *args) {
 	const char *key = NULL;
 	Py_ssize_t len;
 	size_t off = 0;
-	hashset_error_t err;
+	hashset_error_t err = hashset_error_0;
 
 	if(!PyArg_ParseTuple(args, "|y#:Hashset.exists", &key, &len))
 		return NULL;
 
 	if(key) {
 		Py_BEGIN_ALLOW_THREADS
-		err = exists_ge(self, key, len, &off);
+		off = exists_ge(self, key, len, &err);
 		Py_END_ALLOW_THREADS
 		if(err.type != HASHSET_ERROR_NONE) {
-			hashset_error_to_python("iterator", err, self->filename, len, self->hashlen);
+			err.filename = self->filename;
+			hashset_error_to_python("iterator", &err);
 			return NULL;
 		}
 	}
