@@ -116,10 +116,10 @@ static void hashset_error_to_python(const char *function, hashset_error_t *err) 
 		case HASHSET_ERROR_PYTHON:
 			break;
 		case HASHSET_ERROR_HASHLEN:
-			if(err->parameters.hashlen[1] > HASHLEN_MIN)
-				PyErr_Format(PyExc_ValueError, "Hashset.%s(%s): hash lengths do not match (%ld, %ld)", function, err->filename, (long int)err->parameters.hashlen[0], (long int)err->parameters.hashlen[1]);
-			else
+			if(err->parameters.hashlen[1] < HASHLEN_MIN)
 				PyErr_Format(PyExc_ValueError, "Hashset.%s(%s): hash length (%ld) must not be smaller than %ld", function, err->filename, (long int)err->parameters.hashlen[0], (long int)err->parameters.hashlen[1]);
+			else
+				PyErr_Format(PyExc_ValueError, "Hashset.%s(%s): hash lengths do not match (%ld, %ld)", function, err->filename, (long int)err->parameters.hashlen[0], (long int)err->parameters.hashlen[1]);
 			break;
 		case HASHSET_ERROR_ERRNO:
 			if(err->parameters.saved_errno == ENOMEM) {
@@ -683,7 +683,7 @@ static PyObject *Hashset_merge(PyObject *class, PyObject *args) {
 		return NULL;
 }
 
-PyObject *Hashset_new(PyTypeObject *subtype, PyObject *args, PyObject *kwargs) {
+static PyObject *Hashset_new(PyTypeObject *subtype, PyObject *args, PyObject *kwargs) {
 	Hashset_t *hs;
 	const char *bytes;
 	Py_ssize_t len;
@@ -714,6 +714,7 @@ PyObject *Hashset_new(PyTypeObject *subtype, PyObject *args, PyObject *kwargs) {
 				memcpy(hs->buf, bytes, len);
 				qsort_lr(hs->buf, len / hashlen, hashlen, (qsort_lr_cmp)memcmp, NULL);
 				dedup(hs);
+				hs->magic = HASHSET_MAGIC;
 				return &hs->ob_base;
 			}
 		}
@@ -724,7 +725,7 @@ PyObject *Hashset_new(PyTypeObject *subtype, PyObject *args, PyObject *kwargs) {
 	return NULL;
 }
 
-PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs) {
+static PyObject *Hashset_load(PyObject *class, PyObject *args) {
 	Hashset_t *hs = NULL;
 	int fd = -1;
 	struct stat st;
@@ -759,7 +760,9 @@ PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs) {
 											madvise(hs->buf, st.st_size, MADV_WILLNEED);
 
 										hs->filename = strdup(filename);
-										if(!hs->filename)
+										if(hs->filename)
+											hs->magic = HASHSET_MAGIC;
+										else
 											hashset_record_errno(&err, errno);
 									} else {
 										hashset_record_errno(&err, errno);
@@ -803,34 +806,130 @@ PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs) {
 	return err.type == HASHSET_ERROR_NONE ? &hs->ob_base : NULL;
 }
 
-PyObject *Hashset_exists(Hashset_t *hs, PyObject *args) {
-	const char *key;
-	Py_ssize_t len;
+static Py_ssize_t Hashset_length(Hashset_t *hs) {
+	return hs->size / hs->hashlen;
+}
+
+static PyObject *Hashset_item(Hashset_t *hs, Py_ssize_t index) {
 	uint64_t off;
-	hashset_error_t err = hashset_error_0;
+	char *buf;
+	PyObject *bytes;
 
-	if(!PyArg_ParseTuple(args, "y#:Hashset.exists", &key, &len))
+	if(index < 0 || index >= hs->size / hs->hashlen)
+		return PyErr_SetString(PyExc_IndexError, "index out of range"), NULL;
+	off = index * hs->hashlen;
+
+	bytes = PyBytes_FromStringAndSize(NULL, hs->hashlen);
+	if(!bytes)
 		return NULL;
-
-	if(!hs->size)
-		Py_RETURN_FALSE;
+	buf = PyBytes_AsString(bytes);
 
 	Py_BEGIN_ALLOW_THREADS
-	off = exists_ge(hs, key, len, &err);
+	memcpy(buf, hs->buf + off, hs->hashlen);
 	Py_END_ALLOW_THREADS
 
-	if(err.type != HASHSET_ERROR_NONE) {
-		hashset_error_to_python("exists", &err);
+	return bytes;
+}
+
+static PyObject *Hashset_subscript(Hashset_t *hs, PyObject *key) {
+	uint64_t off = 0;
+	hashset_error_t err = hashset_error_0;
+	int d = 0;
+	Py_ssize_t index;
+	Py_buffer buf;
+
+	if(PyIndex_Check(key)) {
+		index = PyNumber_AsSsize_t(key, PyExc_IndexError);
+		if(index == -1 && PyErr_Occurred())
+			return NULL;
+		return Hashset_item(hs, index);
+	}
+
+	if(!hs->size)
+		return PyErr_SetObject(PyExc_KeyError, key), NULL;
+
+	if(!hashset_module_object_to_buffer(key, &buf))
+		return NULL;
+
+	Py_BEGIN_ALLOW_THREADS
+	off = exists_ge(hs, buf.buf, buf.len, &err);
+	if(err.type == HASHSET_ERROR_NONE)
+		d = memcmp((const char *)hs->buf + off, buf.buf, buf.len);
+	Py_END_ALLOW_THREADS
+
+	PyBuffer_Release(&buf);
+
+	if(err.type == HASHSET_ERROR_HASHLEN) {
+		return PyErr_SetObject(PyExc_KeyError, key), NULL;
+	} else if(err.type != HASHSET_ERROR_NONE) {
+		err.filename = hs->filename;
+		hashset_error_to_python("subscript", &err);
 		return NULL;
 	}
 
-	if(memcmp((const char *)hs->buf + off, key, len))
-		Py_RETURN_FALSE;
+	if(d)
+		return PyErr_SetObject(PyExc_KeyError, key), NULL;
 	else
-		Py_RETURN_TRUE;
+		return PyLong_FromSize_t(off / hs->hashlen);
 }
 
-PyObject *Hashset_iterator(Hashset_t *self, PyObject *args) {
+static int Hashset_contains(Hashset_t *hs, PyObject *key) {
+	uint64_t off = 0;
+	hashset_error_t err = hashset_error_0;
+	int d = 0;
+	Py_ssize_t index;
+	Py_buffer buf;
+
+	if(!hs->size)
+		return 0;
+
+	if(PyIndex_Check(key)) {
+		index = PyNumber_AsSsize_t(key, PyExc_IndexError);
+		if(index == -1 && PyErr_Occurred())
+			return -1;
+		return index >= 0 && index < hs->size / hs->hashlen;
+	}
+
+	if(!hashset_module_object_to_buffer(key, &buf))
+		return -1;
+
+	Py_BEGIN_ALLOW_THREADS
+	off = exists_ge(hs, buf.buf, buf.len, &err);
+	if(err.type == HASHSET_ERROR_NONE)
+		d = memcmp((const char *)hs->buf + off, buf.buf, buf.len);
+	Py_END_ALLOW_THREADS
+
+	PyBuffer_Release(&buf);
+
+	if(err.type == HASHSET_ERROR_HASHLEN) {
+		return 0;
+	} else if(err.type != HASHSET_ERROR_NONE) {
+		err.filename = hs->filename;
+		hashset_error_to_python("contains", &err);
+		return -1;
+	}
+
+	return !d;
+}
+
+static PyObject *Hashset_iter(Hashset_t *self) {
+	HashsetIterator_t *c;
+
+	struct hashset_module_state *state = PyModule_GetState(PyState_FindModule(&hashset_module));
+	c = PyObject_New(HashsetIterator_t, state->HashsetIterator_type);
+	if(!c)
+		return NULL;
+
+	c->magic = HASHSET_ITERATOR_MAGIC;
+	c->hs = self;
+	c->off = 0;
+
+	Py_IncRef(&self->ob_base);
+
+	return &c->ob_base;
+}
+
+static PyObject *Hashset_iterate(Hashset_t *self, PyObject *args) {
 	HashsetIterator_t *c;
 	const char *key = NULL;
 	Py_ssize_t len;
@@ -865,23 +964,36 @@ PyObject *Hashset_iterator(Hashset_t *self, PyObject *args) {
 	return &c->ob_base;
 }
 
+static PyObject *Hashset_self(PyObject *self, PyObject *args) {
+	Py_IncRef(self);
+	return self;
+}
+
+static PyObject *Hashset_none(PyObject *self, PyObject *args) {
+	Py_RETURN_NONE;
+}
+
 static PyMethodDef Hashset_methods[] = {
-	{"exists", (PyCFunction)Hashset_exists, METH_O, "test if this key is contained in the Hashset"},
-	{"__iter__", (PyCFunction)Hashset_iterator, METH_NOARGS, "returns an iterator for this hashet"},
 	{"sortfile", Hashset_sortfile, METH_VARARGS|METH_STATIC, "sort the hashes in a file"},
 	{"merge", Hashset_merge, METH_VARARGS|METH_STATIC, "merge Hashsets into a file"},
-//	{"__enter__", (PyCFunction)Hashset_enter, METH_NOARGS, "return a context manager for 'with'"},
-//	{"__exit__", (PyCFunction)Hashset_exit, METH_VARARGS, "callback for 'with' context manager"},
+	{"load", Hashset_load, METH_VARARGS|METH_STATIC, "load a Hashset from a file"},
+	{"iterate", (PyCFunction)Hashset_iterate, METH_VARARGS, "sort the hashes in a file"},
+	{"__enter__", (PyCFunction)Hashset_self, METH_NOARGS, "return a context manager for 'with'"},
+	{"__exit__", (PyCFunction)Hashset_none, METH_VARARGS, "callback for 'with' context manager"},
 	{NULL}
 };
 
 static PyType_Slot Hashset_slots[] = {
-	{Py_tp_dealloc, (destructor)Hashset_dealloc},
-//	{Py_tp_as_mapping, &Hashset_as_mapping},
-//	{Py_tp_iter, (getiterfunc)Hashset_iter},
+	{Py_tp_dealloc, Hashset_dealloc},
+	{Py_tp_iter, Hashset_iter},
 	{Py_tp_methods, Hashset_methods},
 //	{Py_tp_getset, Hashset_getset},
-	{Py_tp_new, (newfunc)Hashset_new},
+	{Py_tp_new, Hashset_new},
+	{Py_mp_subscript, Hashset_subscript},
+	{Py_mp_length, Hashset_length},
+	{Py_sq_contains, Hashset_contains},
+	{Py_sq_item, Hashset_item},
+	{Py_sq_length, Hashset_length},
 	{0, NULL}
 };
 
@@ -893,20 +1005,30 @@ static PyType_Spec Hashset_spec = {
 	Hashset_slots
 };
 
-PyObject *HashsetIterator_next(HashsetIterator_t *self) {
+static PyObject *HashsetIterator_iternext(HashsetIterator_t *self) {
 	Hashset_t *hs;
 	size_t off;
+	char *buf;
+	PyObject *bytes;
 
 	hs = self->hs;
-	if(!hs)
-		return PyErr_SetString(PyExc_TypeError, "Hashset.merge: needs at least 1 argument (0 given)"), NULL;
 
 	off = self->off;
 	if(off >= hs->size)
 		return NULL;
 
 	self->off = off + hs->hashlen;
-	return PyBytes_FromStringAndSize((const char *)hs->buf + off, hs->hashlen);
+
+	bytes = PyBytes_FromStringAndSize(NULL, hs->hashlen);
+	if(!bytes)
+		return NULL;
+	buf = PyBytes_AsString(bytes);
+
+	Py_BEGIN_ALLOW_THREADS
+	memcpy(buf, hs->buf + off, hs->hashlen);
+	Py_END_ALLOW_THREADS
+
+	return bytes;
 }
 
 static int HashsetIterator_dealloc(HashsetIterator_t *obj) {
@@ -916,16 +1038,15 @@ static int HashsetIterator_dealloc(HashsetIterator_t *obj) {
 }
 
 static PyMethodDef HashsetIterator_methods[] = {
-	{"__next__", (PyCFunction)HashsetIterator_next, METH_NOARGS, "returns the next value for this iterator"},
-//	{"__enter__", (PyCFunction)HashsetIterator_enter, METH_NOARGS, "return a context manager for 'with'"},
-//	{"__exit__", (PyCFunction)HashsetIterator_exit, METH_VARARGS, "callback for 'with' context manager"},
+	{"__enter__", Hashset_self, METH_NOARGS, "return a context manager for 'with'"},
+	{"__exit__", Hashset_none, METH_VARARGS, "callback for 'with' context manager"},
 	{NULL}
 };
 
 static PyType_Slot HashsetIterator_slots[] = {
 	{Py_tp_dealloc, (destructor)HashsetIterator_dealloc},
-//	{Py_tp_as_mapping, &Hashset_as_mapping},
-//	{Py_tp_iter, (getiterfunc)Hashset_iter},
+	{Py_tp_iter, PyObject_SelfIter},
+	{Py_tp_iternext, (getiterfunc)HashsetIterator_iternext},
 	{Py_tp_methods, HashsetIterator_methods},
 //	{Py_tp_getset, HashsetIterator_getset},
 //	{Py_tp_new, (newfunc)HashsetIterator_new},
