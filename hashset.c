@@ -437,7 +437,7 @@ static void merge_do(hash_merge_state_t *state, hashset_error_t *err) {
 	hash_merge_source_t *src;
 	char *last;
 	int fd;
-	size_t hashlen = 0;
+	size_t hashlen = state->hashlen;
 
 	if(state->numsources) {
 		if(MERGEBUFSIZE % hashlen)
@@ -541,6 +541,68 @@ static void merge_cleanup(hash_merge_state_t *state) {
 	*state = hash_merge_state_0;
 }
 
+static PyObject *Hashset_merge(PyObject *class, PyObject *args) {
+	Hashset_t *hs;
+	hash_merge_state_t state = hash_merge_state_0;
+	int i;
+	hashset_error_t err = hashset_error_0;
+
+	if(!PyTuple_Check(args))
+		return PyErr_SetString(PyExc_SystemError, "Hashset.merge: new style getargs format but argument is not a tuple"), NULL;
+
+	state.numsources = PyTuple_GET_SIZE(args) - 1;
+	if(state.numsources < 0)
+		return PyErr_SetString(PyExc_TypeError, "Hashset.merge: needs at least 1 argument (0 given)"), NULL;
+
+	if(!hashset_module_filename(PyTuple_GET_ITEM(args, 0), &state.filename_obj))
+		return NULL;
+
+	state.filename = PyBytes_AsString(state.filename_obj);
+	if(state.filename) {
+		err.filename = state.filename;
+		state.sources = malloc(state.numsources * sizeof *state.sources);
+		if(state.sources) {
+			for(i = 0; i < state.numsources; i++) {
+				hs = Hashset_Check(PyTuple_GET_ITEM(args, i + 1));
+				if(!hs) {
+					hashset_record_python_error(&err);
+					break;
+				}
+				state.sources[i].hs = hs;
+				if(i) {
+					if(state.hashlen != hs->hashlen) {
+						PyErr_Format(PyExc_SystemError, "Hashset.merge: objects with differing hashlen (%d, %d)",
+							state.hashlen, hs->hashlen);
+						hashset_record_python_error(&err);
+						break;
+					}
+				} else {
+					state.hashlen = hs->hashlen;
+				}
+			}
+
+			if(i == state.numsources) {
+				Py_BEGIN_ALLOW_THREADS
+				merge_do(&state, &err);
+				Py_END_ALLOW_THREADS
+				hashset_error_to_python("merge", &err);
+			}
+		} else {
+			hashset_record_python_error(&err);
+			PyErr_NoMemory();
+		}
+	} else {
+		hashset_record_python_error(&err);
+	}
+
+	merge_cleanup(&state);
+
+	if(err.type == HASHSET_ERROR_NONE)
+		Py_RETURN_NONE;
+	else
+		return NULL;
+}
+
 static int Hashset_dealloc(Hashset_t *obj) {
 	if(obj->buf != MAP_FAILED)
 		munmap(obj->buf, obj->mapsize);
@@ -617,65 +679,6 @@ static PyObject *Hashset_sortfile(PyObject *class, PyObject *args) {
 	}
 
 	Py_DecRef(filename_obj);
-
-	if(err.type == HASHSET_ERROR_NONE)
-		Py_RETURN_NONE;
-	else
-		return NULL;
-}
-
-static PyObject *Hashset_merge(PyObject *class, PyObject *args) {
-	Hashset_t *hs;
-	hash_merge_state_t state = hash_merge_state_0;
-	int i;
-	hashset_error_t err = hashset_error_0;
-
-	if(!PyTuple_Check(args))
-		return PyErr_SetString(PyExc_SystemError, "Hashset.merge: new style getargs format but argument is not a tuple"), NULL;
-
-	state.numsources = PyTuple_GET_SIZE(args) - 1;
-	if(state.numsources < 0)
-		return PyErr_SetString(PyExc_TypeError, "Hashset.merge: needs at least 1 argument (0 given)"), NULL;
-
-	if(!hashset_module_filename(PyTuple_GET_ITEM(args, 0), &state.filename_obj))
-		return NULL;
-
-	state.filename = PyBytes_AsString(state.filename_obj);
-	if(state.filename) {
-		err.filename = state.filename;
-		state.sources = malloc(state.numsources * sizeof *state.sources);
-		if(state.sources) {
-			for(i = 0; i < state.numsources; i++) {
-				hs = Hashset_Check(PyTuple_GET_ITEM(args, i + 1));
-				if(!hs)
-					break;
-				state.sources[i].hs = hs;
-				if(i) {
-					if(state.hashlen != hs->hashlen) {
-						PyErr_Format(PyExc_SystemError, "Hashset.merge: objects with differing hashlen (%d, %d)",
-							state.hashlen, hs->hashlen);
-						break;
-					}
-				} else {
-					state.hashlen = hs->hashlen;
-				}
-			}
-
-			if(i == state.numsources) {
-				Py_BEGIN_ALLOW_THREADS
-				merge_do(&state, &err);
-				Py_END_ALLOW_THREADS
-				hashset_error_to_python("merge", &err);
-			}
-		} else {
-			hashset_record_python_error(&err);
-			PyErr_NoMemory();
-		}
-	} else {
-		hashset_record_python_error(&err);
-	}
-
-	merge_cleanup(&state);
 
 	if(err.type == HASHSET_ERROR_NONE)
 		Py_RETURN_NONE;
