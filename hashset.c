@@ -79,15 +79,20 @@ struct hashset_module_state {
 #define HASHSET_MAGIC UINT64_C(0xC63E9FDB3D336988)
 #define HASHSET_ITERATOR_MAGIC UINT64_C(0x2BF1D59A332EF8E5)
 
-typedef struct hashset_error {
-	enum {
+typedef enum {
 		HASHSET_ERROR_NONE,
 		HASHSET_ERROR_ERRNO,
-		HASHSET_ERROR_ERRNO_WITH_FILENAME,
 		HASHSET_ERROR_HASHLEN,
 		HASHSET_ERROR_PYTHON,
-	} type:32;
-	int saved_errno;
+} hashset_error_type_t;
+
+typedef struct hashset_error {
+	const char *filename;
+	union {
+		int saved_errno;
+		Py_ssize_t hashlen[2];
+	} parameters;
+	hashset_error_type_t type:8;
 } hashset_error_t;
 
 #define HASHLEN_MIN ((Py_ssize_t)8)
@@ -103,32 +108,48 @@ typedef struct hashset_error {
 #define RETURN_IF_OK(x) return PyErr_Occurred() ? NULL : (x)
 #define RETURN_NONE_IF_OK RETURN_IF_OK((Py_INCREF(Py_None), Py_None))
 
-static hashset_error_t hashset_error_to_python(const char *function, hashset_error_t err, const char *filename, size_t hashlen, size_t other_hashlen) {
-	switch(err.type) {
+static void hashset_error_to_python(const char *function, hashset_error_t *err) {
+	switch(err->type) {
 		case HASHSET_ERROR_NONE:
 		case HASHSET_ERROR_PYTHON:
 			break;
 		case HASHSET_ERROR_HASHLEN:
-			if(hashlen)
-				PyErr_Format(PyExc_ValueError, "Hashset.%s(%s): hash lengths do not match (%ld, %ld) for %s", function, (long int)hashlen, (long int)other_hashlen, filename);
+			if(err->parameters.hashlen[1] > HASHLEN_MIN)
+				PyErr_Format(PyExc_ValueError, "Hashset.%s(%s): hash lengths do not match (%ld, %ld)", function, err->filename, (long int)err->parameters.hashlen[0], (long int)err->parameters.hashlen[1]);
 			else
-				PyErr_Format(PyExc_ValueError, "Hashset.%s(%s): hash length must not be 0", function, filename);
+				PyErr_Format(PyExc_ValueError, "Hashset.%s(%s): hash length (%ld) must not be smaller than %ld", function, err->filename, (long int)err->parameters.hashlen[0], (long int)err->parameters.hashlen[1]);
 			break;
 		case HASHSET_ERROR_ERRNO:
-			if(err.saved_errno == ENOMEM) {
+			if(err->parameters.saved_errno == ENOMEM) {
 				PyErr_NoMemory();
 			} else {
-				errno = err.saved_errno;
-				PyErr_SetFromErrno(PyExc_OSError);
+				errno = err->parameters.saved_errno;
+				if(err->filename)
+					PyErr_SetFromErrnoWithFilename(PyExc_OSError, err->filename);
+				else
+					PyErr_SetFromErrno(PyExc_OSError);
 			}
 			break;
-		case HASHSET_ERROR_ERRNO_WITH_FILENAME:
-			errno = err.saved_errno;
-			PyErr_SetFromErrnoWithFilename(PyExc_OSError, filename);
-			break;
 	}
+}
 
-	return (hashset_error_t){HASHSET_ERROR_PYTHON, 0};
+static inline void hashset_clear_error(hashset_error_t *err) {
+	err->type = HASHSET_ERROR_NONE;
+}
+
+static inline void hashset_record_hashlen_error(hashset_error_t *err, Py_ssize_t hashlen0, Py_ssize_t hashlen1) {
+	err->type = HASHSET_ERROR_HASHLEN;
+	err->parameters.hashlen[0] = hashlen0;
+	err->parameters.hashlen[1] = hashlen1;
+}
+
+static inline void hashset_record_errno(hashset_error_t *err, int saved_errno) {
+	err->type = HASHSET_ERROR_ERRNO;
+	err->parameters.saved_errno = saved_errno;
+}
+
+static inline void hashset_record_python_error(hashset_error_t *err) {
+	err->type = HASHSET_ERROR_PYTHON;
 }
 
 static inline Hashset_t *Hashset_Check(PyObject *v) {
@@ -269,19 +290,17 @@ static uint64_t guess(uint64_t lower, uint64_t upper, uint64_t lower_hash, uint6
 #endif
 }
 
-static hashset_error_t exists_ge(const Hashset_t *hs, const void *key, size_t len, uint64_t *retp) {
+static uint64_t exists_ge(const Hashset_t *hs, const void *key, size_t len, hashset_error_t *err) {
 	const uint8_t *buf, *cur_buf;
 	uint64_t lower, upper, cur, lower_hash, upper_hash, target;
 	int d;
 
 	if(len != hs->hashlen)
-		return (hashset_error_t){HASHSET_ERROR_HASHLEN, 0};
-	if(len < 8)
-		return (hashset_error_t){HASHSET_ERROR_HASHLEN, 0};
+		return hashset_record_hashlen_error(err, len, hs->hashlen), 0;
 
 	upper = hs->size / len;
 	if(!upper)
-		return *retp = 0, (hashset_error_t){HASHSET_ERROR_NONE, 0};
+		return err->type = HASHSET_ERROR_NONE, 0;
 
 	buf = hs->buf;
 	lower = 0;
@@ -311,8 +330,7 @@ static hashset_error_t exists_ge(const Hashset_t *hs, const void *key, size_t le
 			break;
 	}
 
-	*retp = cur * (uint64_t)len;
-	return (hashset_error_t){HASHSET_ERROR_NONE, 0};
+	return hashset_clear_error(err), cur * (uint64_t)len;
 }
 
 static void queue_update_up(hash_merge_state_t *state, size_t i) {
@@ -393,7 +411,7 @@ static void queue_update(hash_merge_state_t *state, size_t i) {
 		queue_update_up(state, i);
 }
 
-static hashset_error_t safewrite(hash_merge_state_t *state) {
+static void safewrite(hash_merge_state_t *state, hashset_error_t *err) {
 	ssize_t r;
 	state->written += state->fill;
 	const char *buf = state->buf;
@@ -401,17 +419,17 @@ static hashset_error_t safewrite(hash_merge_state_t *state) {
 		r = write(state->fd, buf, state->fill);
 		switch(r) {
 			case -1:
-				return (hashset_error_t){HASHSET_ERROR_ERRNO_WITH_FILENAME, errno};
+				return hashset_record_errno(err, errno);
 			case 0:
-				return (hashset_error_t){HASHSET_ERROR_ERRNO_WITH_FILENAME, EAGAIN};
+				return hashset_record_errno(err, EAGAIN);
 		}
 		buf += (size_t)r;
 		state->fill -= (size_t)r;
 	}
-	return (hashset_error_t){HASHSET_ERROR_NONE, 0};
+	return hashset_clear_error(err);
 }
 
-static hashset_error_t merge_do(hash_merge_state_t *state) {
+static void merge_do(hash_merge_state_t *state, hashset_error_t *err) {
 	size_t i;
 	Hashset_t *hs;
 	hash_merge_source_t *src;
