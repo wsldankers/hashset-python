@@ -563,7 +563,7 @@ static PyObject *Hashset_sortfile(PyObject *class, PyObject *args) {
 	char *filename;
 	hashset_error_t err = hashset_error_0;
 
-	if(!PyArg_ParseTuple(args, "O&n:sortfile", &filename_obj, hashset_module_filename, &hashlen))
+	if(!PyArg_ParseTuple(args, "O&n:sortfile", hashset_module_filename, &filename_obj, &hashlen))
 		return NULL;
 
 	filename = PyBytes_AsString(filename_obj);
@@ -733,7 +733,7 @@ PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs) {
 	char *filename;
 	hashset_error_t err = hashset_error_0;
 
-	if(!PyArg_ParseTuple(args, "O&n:Hashset.load", &filename_obj, hashset_module_filename, &hashlen))
+	if(!PyArg_ParseTuple(args, "O&n:Hashset.load", hashset_module_filename, &filename_obj, &hashlen))
 		return NULL;
 
 	filename = PyBytes_AsString(filename_obj);
