@@ -25,7 +25,6 @@
 #endif
 
 typedef int (*qsort_lr_cmp)(const void *, const void *, size_t, void *);
-
 extern void qsort_lr(void *const pbase, size_t total_elems, size_t size, qsort_lr_cmp, void *arg);
 
 typedef struct Hashset {
@@ -376,13 +375,13 @@ static void queue_update_up(hash_merge_state_t *state, size_t i) {
 }
 
 static void queue_init(hash_merge_state_t *state) {
-	size_t i = i = state->queuelen / 2;
+	size_t i = state->queuelen / 2;
 
 	do queue_update_up(state, i);
 		while(i--);
 }
 
-__attribute__((unused))
+/*
 static void queue_update(hash_merge_state_t *state, size_t i) {
 	size_t i1;
 	hash_merge_source_t *s, *s1;
@@ -395,7 +394,7 @@ static void queue_update(hash_merge_state_t *state, size_t i) {
 	a = s->buf + s->off;
 	i1 = queuelen;
 
-	/* bubble down */
+	// bubble down
 	while(i) {
 		i1 = (i - 1) / 2;
 		s1 = queue[i1];
@@ -412,10 +411,10 @@ static void queue_update(hash_merge_state_t *state, size_t i) {
 	if(i != i1)
 		queue_update_up(state, i);
 }
+*/
 
 static void safewrite(hash_merge_state_t *state, hashset_error_t *err) {
 	ssize_t r;
-	state->written += state->fill;
 	const char *buf = state->buf;
 	while(state->fill) {
 		r = write(state->fd, buf, state->fill);
@@ -427,6 +426,7 @@ static void safewrite(hash_merge_state_t *state, hashset_error_t *err) {
 		}
 		buf += (size_t)r;
 		state->fill -= (size_t)r;
+		state->written += (size_t)r;
 	}
 	return hashset_clear_error(err);
 }
@@ -455,65 +455,63 @@ static void merge_do(hash_merge_state_t *state, hashset_error_t *err) {
 	if(fd == -1)
 		return hashset_record_errno(err, errno);
 
-	state->queue = malloc(state->numsources * sizeof *state->queue);
-	if(!state->queue)
-		return hashset_record_errno(err, errno);
+	if(state->numsources) {
+		state->queue = malloc(state->numsources * sizeof *state->queue);
+		if(!state->queue)
+			return hashset_record_errno(err, errno);
 
-	state->sources = malloc(state->numsources * sizeof *state->sources);
-	if(!state->sources)
-		return hashset_record_errno(err, errno);
-
-	for(i = 0; i < state->numsources; i++)
-		state->sources[i] = hash_merge_source_0;
-
-	for(i = 0; i < state->numsources; i++) {
-		src = state->sources + i;
-		hs = src->hs;
-		src->buf = hs->buf;
-		src->end = hs->size;
-		if(src->end)
-			state->queue[state->queuelen++] = src;
-	}
-
-	if(state->queuelen) {
-		queue_init(state);
-		src = state->queue[0];
-	}
-
-	while(state->queuelen) {
-		last = state->buf + state->fill;
-		memcpy(last, src->buf + src->off, hashlen);
-		state->fill += hashlen;
-		src->off += hashlen;
-		if(src->off == src->end) {
-			if(!--state->queuelen)
-				break;
-			state->queue[0] = state->queue[state->queuelen];
+		for(i = 0; i < state->numsources; i++) {
+			src = state->sources + i;
+			hs = src->hs;
+			src->off = 0;
+			src->buf = hs->buf;
+			src->end = hs->size;
+			if(src->end)
+				state->queue[state->queuelen++] = src;
 		}
-		/* skip duplicate hashes */
-		for(;;) {
-			queue_update_up(state, 0);
+
+		if(state->queuelen) {
+			queue_init(state);
 			src = state->queue[0];
-			if(memcmp(last, src->buf + src->off, hashlen))
-				break;
+		}
+
+		while(state->queuelen) {
+			last = state->buf + state->fill;
+			memcpy(last, src->buf + src->off, hashlen);
+			state->fill += hashlen;
 			src->off += hashlen;
 			if(src->off == src->end) {
 				if(!--state->queuelen)
 					break;
 				state->queue[0] = state->queue[state->queuelen];
 			}
+
+			/* skip duplicate hashes */
+			for(;;) {
+				queue_update_up(state, 0);
+				src = state->queue[0];
+				if(memcmp(last, src->buf + src->off, hashlen))
+					break;
+				src->off += hashlen;
+				if(src->off == src->end) {
+					if(!--state->queuelen)
+						break;
+					state->queue[0] = state->queue[state->queuelen];
+				}
+			}
+
+			if(state->fill == MERGEBUFSIZE) {
+				safewrite(state, err);
+				if(err->type != HASHSET_ERROR_NONE)
+					return;
+			}
 		}
-		if(state->fill == MERGEBUFSIZE) {
+
+		if(state->fill) {
 			safewrite(state, err);
 			if(err->type != HASHSET_ERROR_NONE)
 				return;
 		}
-	}
-
-	if(state->fill) {
-		safewrite(state, err);
-		if(err->type != HASHSET_ERROR_NONE)
-			return;
 	}
 
 	if(ftruncate(fd, state->written) == -1)
@@ -536,7 +534,7 @@ static void merge_cleanup(hash_merge_state_t *state) {
 		close(state->fd);
 	if(state->buf != MAP_FAILED)
 		munmap(state->buf, MERGEBUFSIZE);
-	Py_DecRef(state->filename_obj);
+	Py_CLEAR(state->filename_obj);
 
 	*state = hash_merge_state_0;
 }
@@ -606,12 +604,12 @@ static PyObject *Hashset_merge(PyObject *class, PyObject *args) {
 static int Hashset_dealloc(Hashset_t *obj) {
 	if(obj->buf != MAP_FAILED)
 		munmap(obj->buf, obj->mapsize);
-	obj->buf = MAP_FAILED;
 
 	free(obj->filename);
-	obj->filename = NULL;
 
 	Py_CLEAR(obj->filename_obj);
+
+	*obj = Hashset_0;
 
 	return 0;
 }
@@ -763,10 +761,11 @@ static PyObject *Hashset_load(PyObject *class, PyObject *args) {
 											madvise(hs->buf, st.st_size, MADV_WILLNEED);
 
 										hs->filename = strdup(filename);
-										if(hs->filename)
+										if(hs->filename) {
 											hs->magic = HASHSET_MAGIC;
-										else
+										} else {
 											hashset_record_errno(&err, errno);
+										}
 									} else {
 										hashset_record_errno(&err, errno);
 									}
@@ -804,9 +803,13 @@ static PyObject *Hashset_load(PyObject *class, PyObject *args) {
 		}
 	}
 
-	Py_DecRef(filename_obj);
-
-	return err.type == HASHSET_ERROR_NONE ? &hs->ob_base : NULL;
+	if(err.type == HASHSET_ERROR_NONE) {
+		hs->filename_obj = filename_obj;
+		return &hs->ob_base;
+	} else {
+		Py_DecRef(filename_obj);
+		return NULL;
+	}
 }
 
 static Py_ssize_t Hashset_length(Hashset_t *hs) {
@@ -817,18 +820,22 @@ static PyObject *Hashset_item(Hashset_t *hs, Py_ssize_t index) {
 	uint64_t off;
 	char *buf;
 	PyObject *bytes;
+	Py_ssize_t hashlen = hs->hashlen;
+	Py_ssize_t len = hs->size / hashlen;
 
-	if(index < 0 || index >= hs->size / hs->hashlen)
+	if(index < 0)
+		index += len;
+	if(index < 0 || index >= len)
 		return PyErr_SetString(PyExc_IndexError, "index out of range"), NULL;
-	off = index * hs->hashlen;
+	off = index * hashlen;
 
-	bytes = PyBytes_FromStringAndSize(NULL, hs->hashlen);
+	bytes = PyBytes_FromStringAndSize(NULL, hashlen);
 	if(!bytes)
 		return NULL;
 	buf = PyBytes_AsString(bytes);
 
 	Py_BEGIN_ALLOW_THREADS
-	memcpy(buf, hs->buf + off, hs->hashlen);
+	memcpy(buf, hs->buf + off, hashlen);
 	Py_END_ALLOW_THREADS
 
 	return bytes;
