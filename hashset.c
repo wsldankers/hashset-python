@@ -604,12 +604,12 @@ static PyObject *Hashset_merge(PyObject *class, PyObject *args) {
 static int Hashset_dealloc(Hashset_t *obj) {
 	if(obj->buf != MAP_FAILED)
 		munmap(obj->buf, obj->mapsize);
+	obj->buf = MAP_FAILED;
 
 	free(obj->filename);
+	obj->filename = NULL;
 
 	Py_CLEAR(obj->filename_obj);
-
-	*obj = Hashset_0;
 
 	return 0;
 }
@@ -705,6 +705,8 @@ static PyObject *Hashset_new(PyTypeObject *subtype, PyObject *args, PyObject *kw
 	hs = PyObject_New(Hashset_t, subtype);
 	if(hs) {
 		hs->hashlen = (size_t)hashlen;
+		hs->filename = NULL;
+		hs->filename_obj = NULL;
 
 		if(len) {
 			hs->buf = mmap(NULL, (size_t)len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
