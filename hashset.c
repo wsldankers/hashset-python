@@ -74,6 +74,7 @@ struct hashset_module_state {
 	PyTypeObject *Hashset_type;
 	PyTypeObject *HashsetIterator_type;
 };
+static const struct hashset_module_state hashset_module_state_0 = {0};
 
 #define HASHSET_MAGIC UINT64_C(0xC63E9FDB3D336988)
 #define HASHSET_ITERATOR_MAGIC UINT64_C(0x2BF1D59A332EF8E5)
@@ -1099,6 +1100,7 @@ PyMODINIT_FUNC PyInit_hashset(void) {
 	PyObject *module = PyModule_Create(&hashset_module);
 	if(module) {
 		struct hashset_module_state *state = PyModule_GetState(module);
+		*state = hashset_module_state_0;
 		state->Hashset_type = (PyTypeObject *)PyType_FromSpec(&Hashset_spec);
 		if(PyModule_AddObject(module, "Hashset", &state->Hashset_type->ob_base.ob_base) != -1) {
 			Py_IncRef(&state->Hashset_type->ob_base.ob_base);
@@ -1107,9 +1109,7 @@ PyMODINIT_FUNC PyInit_hashset(void) {
 				Py_IncRef(&state->HashsetIterator_type->ob_base.ob_base);
 				return module;
 			}
-			Py_CLEAR(state->HashsetIterator_type);
 		}
-		Py_CLEAR(state->Hashset_type);
 		Py_DecRef(module);
 	}
 	return NULL;
