@@ -606,10 +606,11 @@ static int Hashset_dealloc(Hashset_t *obj) {
 		munmap(obj->buf, obj->mapsize);
 	obj->buf = MAP_FAILED;
 
-	free(obj->filename);
 	obj->filename = NULL;
-
 	Py_CLEAR(obj->filename_obj);
+
+	freefunc tp_free = Py_TYPE(obj)->tp_free ?: PyObject_Free;
+	tp_free(obj);
 
 	return 0;
 }
@@ -703,27 +704,31 @@ static PyObject *Hashset_new(PyTypeObject *subtype, PyObject *args, PyObject *kw
 		return PyErr_Format(PyExc_ValueError, "Hashset.new: buffer size (%zd) is not a multiple of the key length (%zd)", len, hashlen);
 
 	hs = PyObject_New(Hashset_t, subtype);
-	if(hs) {
-		hs->hashlen = (size_t)hashlen;
-		hs->filename = NULL;
-		hs->filename_obj = NULL;
+	if(!hs)
+		return NULL;
 
-		if(len) {
-			hs->buf = mmap(NULL, (size_t)len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-			if(hs->buf == MAP_FAILED) {
-				PyErr_SetFromErrno(PyExc_OSError);
-			} else {
-				hs->size = hs->mapsize = len;
-				memcpy(hs->buf, bytes, len);
-				qsort_lr(hs->buf, len / hashlen, hashlen, (qsort_lr_cmp)memcmp, NULL);
-				dedup(hs);
-				hs->magic = HASHSET_MAGIC;
-				return &hs->ob_base;
-			}
+	hs->magic = HASHSET_MAGIC;
+	hs->buf = MAP_FAILED;
+	hs->filename = NULL;
+	hs->filename_obj = NULL;
+	hs->size = 0;
+	hs->mapsize = 0;
+	hs->hashlen = (size_t)hashlen;
+
+	if(len) {
+		hs->buf = mmap(NULL, (size_t)len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+		if(hs->buf == MAP_FAILED) {
+			PyErr_SetFromErrno(PyExc_OSError);
+		} else {
+			hs->size = hs->mapsize = len;
+			memcpy(hs->buf, bytes, len);
+			qsort_lr(hs->buf, len / hashlen, hashlen, (qsort_lr_cmp)memcmp, NULL);
+			dedup(hs);
+			return &hs->ob_base;
 		}
-
-		PyObject_Del(&hs->ob_base);
 	}
+
+	Py_DecRef(&hs->ob_base);
 
 	return NULL;
 }
@@ -732,84 +737,80 @@ static PyObject *Hashset_load(PyObject *class, PyObject *args) {
 	Hashset_t *hs = NULL;
 	int fd = -1;
 	struct stat st;
-	Py_ssize_t hashlen;
-	PyObject *filename_obj;
-	char *filename;
 	hashset_error_t err = hashset_error_0;
 
-	if(!PyArg_ParseTuple(args, "O&n:Hashset.load", hashset_module_filename, &filename_obj, &hashlen))
+	struct hashset_module_state *state = PyModule_GetState(PyState_FindModule(&hashset_module));
+	if(!state)
+		return PyErr_SetString(PyExc_SystemError, "internal error: unable to locate module state"), NULL;
+
+	hs = PyObject_New(Hashset_t, state->Hashset_type);
+	if(!hs)
 		return NULL;
 
-	filename = PyBytes_AsString(filename_obj);
-	if(filename) {
-		if(hashlen >= HASHLEN_MIN) {
-			struct hashset_module_state *state = PyModule_GetState(PyState_FindModule(&hashset_module));
-			if(state) {
-				hs = PyObject_New(Hashset_t, state->Hashset_type);
-				if(hs) {
-					Py_BEGIN_ALLOW_THREADS
-					hs->hashlen = hashlen;
+	hs->magic = HASHSET_MAGIC;
+	hs->buf = MAP_FAILED;
+	hs->filename = NULL;
+	hs->filename_obj = NULL;
+	hs->size = 0;
+	hs->mapsize = 0;
+	hs->hashlen = 0;
 
-					fd = open(filename, O_RDONLY|O_NOCTTY|O_LARGEFILE);
-					if(fd != -1) {
-						if(fstat(fd, &st) != -1) {
-							if(st.st_size % hashlen == 0) {
-								hs->buf = st.st_size ? mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0) : NULL;
+	if(PyArg_ParseTuple(args, "O&n:Hashset.load", hashset_module_filename, &hs->filename_obj, &hs->hashlen)) {
+		hs->filename = PyBytes_AsString(hs->filename_obj);
+		if(hs->filename) {
+			err.filename = hs->filename;
+			if(hs->hashlen >= HASHLEN_MIN) {
+				Py_BEGIN_ALLOW_THREADS
+				fd = open(hs->filename, O_RDONLY|O_NOCTTY|O_LARGEFILE);
+				if(fd != -1) {
+					if(fstat(fd, &st) != -1) {
+						if(st.st_size) {
+							if(st.st_size % hs->hashlen == 0) {
+								hs->buf = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
 								if(hs->buf != MAP_FAILED) {
 									hs->mapsize = hs->size = st.st_size;
-									if(close(fd) != -1) {
-										hashset_clear_error(&err);
-										if(st.st_size)
-											madvise(hs->buf, st.st_size, MADV_WILLNEED);
-
-										hs->filename = strdup(filename);
-										if(hs->filename) {
-											hs->magic = HASHSET_MAGIC;
-										} else {
-											hashset_record_errno(&err, errno);
-										}
-									} else {
+									if(close(fd) != -1)
+										madvise(hs->buf, st.st_size, MADV_WILLNEED);
+									else
 										hashset_record_errno(&err, errno);
-									}
 									fd = -1;
 								} else {
 									hashset_record_errno(&err, errno);
 								}
 							} else {
-								hashset_record_hashlen_error(&err, st.st_size, hashlen);
+								hashset_record_hashlen_error(&err, st.st_size, hs->hashlen);
 							}
 						} else {
-							hashset_record_errno(&err, errno);
+							if(close(fd) == -1)
+								hashset_record_errno(&err, errno);
+							fd = -1;
 						}
-						if(fd != -1)
-							close(fd);
 					} else {
 						hashset_record_errno(&err, errno);
 					}
-					Py_END_ALLOW_THREADS
-
-					if(err.type != HASHSET_ERROR_NONE) {
-						Py_DecRef(&hs->ob_base);
-
-						err.filename = filename;
-						hashset_error_to_python("load", &err);
-					}
+					if(fd != -1)
+						close(fd);
+				} else {
+					hashset_record_errno(&err, errno);
 				}
+				Py_END_ALLOW_THREADS
 			} else {
-				PyErr_SetString(PyExc_SystemError, "internal error: unable to locate module state");
+				PyErr_Format(PyExc_ValueError, "Hashset.load(%s, %zd): hash length must be at least %zd", hs->filename, hs->hashlen, HASHLEN_MIN);
 				hashset_record_python_error(&err);
 			}
 		} else {
-			PyErr_Format(PyExc_ValueError, "Hashset.load(%s, %zd): hash length must be at least %zd", filename, hashlen, HASHLEN_MIN);
 			hashset_record_python_error(&err);
 		}
+	} else {
+		hashset_record_python_error(&err);
 	}
 
 	if(err.type == HASHSET_ERROR_NONE) {
-		hs->filename_obj = filename_obj;
 		return &hs->ob_base;
 	} else {
-		Py_DecRef(filename_obj);
+		err.filename = hs->filename;
+		hashset_error_to_python("load", &err);
+		Py_DecRef(&hs->ob_base);
 		return NULL;
 	}
 }
@@ -997,6 +998,7 @@ static PyMethodDef Hashset_methods[] = {
 
 static PyType_Slot Hashset_slots[] = {
 	{Py_tp_dealloc, Hashset_dealloc},
+	{Py_tp_free, PyObject_Free},
 	{Py_tp_iter, Hashset_iter},
 	{Py_tp_methods, Hashset_methods},
 //	{Py_tp_getset, Hashset_getset},
@@ -1046,6 +1048,9 @@ static PyObject *HashsetIterator_iternext(HashsetIterator_t *self) {
 static int HashsetIterator_dealloc(HashsetIterator_t *obj) {
 	Py_CLEAR(obj->hs);
 
+	freefunc tp_free = Py_TYPE(obj)->tp_free ?: PyObject_Free;
+	tp_free(obj);
+
 	return 0;
 }
 
@@ -1057,6 +1062,7 @@ static PyMethodDef HashsetIterator_methods[] = {
 
 static PyType_Slot HashsetIterator_slots[] = {
 	{Py_tp_dealloc, (destructor)HashsetIterator_dealloc},
+	{Py_tp_free, PyObject_Free},
 	{Py_tp_iter, PyObject_SelfIter},
 	{Py_tp_iternext, (getiterfunc)HashsetIterator_iternext},
 	{Py_tp_methods, HashsetIterator_methods},
