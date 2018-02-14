@@ -452,7 +452,7 @@ static void merge_do(hash_merge_state_t *state, hashset_error_t *err) {
 			return hashset_record_errno(err, errno);
 	}
 
-	fd = state->fd = open(state->filename, O_WRONLY|O_CREAT|O_NOCTTY|O_LARGEFILE, 0666);
+	fd = state->fd = open(state->filename, O_WRONLY|O_CREAT|O_NOCTTY|O_LARGEFILE|O_CLOEXEC, 0666);
 	if(fd == -1)
 		return hashset_record_errno(err, errno);
 
@@ -633,7 +633,7 @@ static PyObject *Hashset_sortfile(PyObject *class, PyObject *args) {
 		err.filename = filename;
 		Py_BEGIN_ALLOW_THREADS
 		if(hashlen >= HASHLEN_MIN) {
-			fd = open(filename, O_RDWR|O_NOCTTY|O_LARGEFILE);
+			fd = open(filename, O_RDWR|O_NOCTTY|O_LARGEFILE|O_CLOEXEC);
 			if(fd != -1) {
 				if(fstat(fd, &st) != -1) {
 					if(st.st_size % hashlen == 0) {
@@ -762,7 +762,7 @@ static PyObject *Hashset_load(PyObject *class, PyObject *args) {
 			err.filename = hs->filename;
 			if(hs->hashlen >= HASHLEN_MIN) {
 				Py_BEGIN_ALLOW_THREADS
-				fd = open(hs->filename, O_RDONLY|O_NOCTTY|O_LARGEFILE);
+				fd = open(hs->filename, O_RDONLY|O_NOCTTY|O_LARGEFILE|O_CLOEXEC);
 				if(fd != -1) {
 					if(fstat(fd, &st) != -1) {
 						if(st.st_size) {
