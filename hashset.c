@@ -103,9 +103,6 @@ static const hashset_error_t hashset_error_0 = {0, {0}, HASHSET_ERROR_NONE};
 #endif
 
 #define MERGEBUFSIZE (1 << 21)
-#define OK (!PyErr_Occurred())
-#define RETURN_IF_OK(x) return PyErr_Occurred() ? NULL : (x)
-#define RETURN_NONE_IF_OK RETURN_IF_OK((Py_INCREF(Py_None), Py_None))
 
 static void hashset_error_to_python(const char *function, hashset_error_t *err) {
 	switch(err->type) {
@@ -684,9 +681,6 @@ static PyObject *Hashset_new(PyTypeObject *subtype, PyObject *args, PyObject *kw
 	const char *bytes;
 	Py_ssize_t len;
 	Py_ssize_t hashlen;
-
-	if(!OK)
-		return NULL;
 
 	if(!PyArg_ParseTuple(args, "y#n:Hashset.new", &bytes, &len, &hashlen))
 		return NULL;
