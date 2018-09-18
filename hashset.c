@@ -66,8 +66,10 @@ typedef struct hash_merge_state {
 	size_t queuelen;
 	size_t hashlen;
 	int fd;
+	int mode;
+	int dirfd;
 } hash_merge_state_t;
-static const hash_merge_state_t hash_merge_state_0 = {.fd = -1, .buf = MAP_FAILED};
+static const hash_merge_state_t hash_merge_state_0 = {.fd = -1, .buf = MAP_FAILED, .mode = 0666, .dirfd = AT_FDCWD};
 
 static struct PyModuleDef hashset_module;
 static PyTypeObject Hashset_type;
@@ -304,7 +306,7 @@ static uint64_t exists_ge(const Hashset_t *hs, const void *key, size_t len, hash
 		cur = lower_hash == upper_hash
 			? lower + (upper - lower) / 2
 			: guess(lower, upper, lower_hash, upper_hash, target);
-		/* warn("\rguess=%"PRIu64" lower=%"PRIu64" upper=%"PRIu64" lower_hash=0x%016"PRIu64" upper_hash=0x%016"PRIx64" target=%016"PRIx64"\033[K", cur, lower, upper, lower_hash, upper_hash, target); */
+		//warn("\rguess=%"PRIu64" lower=%"PRIu64" upper=%"PRIu64" lower_hash=0x%016"PRIu64" upper_hash=0x%016"PRIx64" target=%016"PRIx64"\033[K", cur, lower, upper, lower_hash, upper_hash, target);
 		/* if(cur < lower) croak("cur < lower"); */
 		/* if(cur >= upper) croak("cur >= upper"); */
 		cur_buf = buf + cur * len;
@@ -321,6 +323,7 @@ static uint64_t exists_ge(const Hashset_t *hs, const void *key, size_t len, hash
 		if(lower == upper)
 			break;
 	}
+	//warn("found=%"PRIu64"\033[K", cur);
 
 	return hashset_clear_error(err), cur * (uint64_t)len;
 }
@@ -442,7 +445,7 @@ static void merge_do(hash_merge_state_t *state, hashset_error_t *err) {
 			return hashset_record_errno(err, errno);
 	}
 
-	fd = state->fd = open(state->filename, O_WRONLY|O_CREAT|O_NOCTTY|O_LARGEFILE|O_CLOEXEC, 0666);
+	fd = state->fd = openat(state->dirfd, state->filename, O_WRONLY|O_CREAT|O_NOCTTY|O_LARGEFILE|O_CLOEXEC, state->mode);
 	if(fd == -1)
 		return hashset_record_errno(err, errno);
 
@@ -530,30 +533,36 @@ static void merge_cleanup(hash_merge_state_t *state) {
 	*state = hash_merge_state_0;
 }
 
-static PyObject *Hashset_merge(PyObject *class, PyObject *args) {
-	Hashset_t *hs;
-	hash_merge_state_t state = hash_merge_state_0;
-	int i;
-	hashset_error_t err = hashset_error_0;
-
+static PyObject *Hashset_merge(PyObject *class, PyObject *args, PyObject *kwargs) {
 	if(!PyTuple_Check(args))
 		return PyErr_SetString(PyExc_SystemError, "Hashset.merge: new style getargs format but argument is not a tuple"), NULL;
 
-	state.numsources = PyTuple_GET_SIZE(args) - 1;
+	hash_merge_state_t state = hash_merge_state_0;
+	state.numsources = PyTuple_GET_SIZE(args);
 	if(state.numsources < 0)
 		return PyErr_SetString(PyExc_TypeError, "Hashset.merge: needs at least 1 argument (0 given)"), NULL;
 
-	if(!hashset_module_filename(PyTuple_GET_ITEM(args, 0), &state.filename_obj))
+	static char *keywords[] = {"path", "mode", "dir_fd", NULL};
+	PyObject *empty_tuple = PyTuple_New(0);
+	if(!empty_tuple)
+		return NULL;
+	int ok = PyArg_ParseTupleAndKeywords(empty_tuple, kwargs, "O&|ii", keywords,
+		hashset_module_filename, &state.filename_obj, &state.mode, &state.dirfd);
+	Py_DecRef(empty_tuple);
+	if(!ok)
 		return NULL;
 
+	hashset_error_t err = hashset_error_0;
 	state.filename = PyBytes_AsString(state.filename_obj);
 	if(state.filename) {
 		err.filename = state.filename;
 		state.sources = malloc(state.numsources * sizeof *state.sources);
 		if(state.sources) {
+			int i;
 			for(i = 0; i < state.numsources; i++) {
-				hs = Hashset_Check(PyTuple_GET_ITEM(args, i + 1));
+				Hashset_t *hs = Hashset_Check(PyTuple_GET_ITEM(args, i));
 				if(!hs) {
+					PyErr_Format(PyExc_TypeError, "Hashset.merge: argument %d is not a valid Hashset object", i);
 					hashset_record_python_error(&err);
 					break;
 				}
@@ -592,30 +601,37 @@ static PyObject *Hashset_merge(PyObject *class, PyObject *args) {
 		return NULL;
 }
 
-static int Hashset_dealloc(Hashset_t *obj) {
-	if(obj->buf != MAP_FAILED)
-		munmap(obj->buf, obj->mapsize);
-	obj->buf = MAP_FAILED;
+static int Hashset_dealloc(PyObject *self) {
+	Hashset_t *hs = Hashset_Check(self);
+	if(hs) {
+		hs->magic = 0;
+		if(hs->buf != MAP_FAILED)
+			munmap(hs->buf, hs->mapsize);
+		hs->buf = MAP_FAILED;
 
-	obj->filename = NULL;
-	Py_CLEAR(obj->filename_obj);
+		hs->filename = NULL;
+		Py_CLEAR(hs->filename_obj);
+	}
 
-	freefunc tp_free = Py_TYPE(obj)->tp_free ?: PyObject_Free;
-	tp_free(obj);
+	freefunc tp_free = Py_TYPE(self)->tp_free ?: PyObject_Free;
+	tp_free(self);
 
 	return 0;
 }
 
-static PyObject *Hashset_sortfile(PyObject *class, PyObject *args) {
-	int fd;
+static PyObject *Hashset_sortfile(PyObject *class, PyObject *args, PyObject *kwargs) {
+	int fd, dirfd = AT_FDCWD;
+	int mode = 0666;
 	struct stat st;
 	Hashset_t hs = Hashset_0;
 	PyObject *filename_obj;
 	Py_ssize_t hashlen;
 	char *filename;
 	hashset_error_t err = hashset_error_0;
+	static char *keywords[] = {"", "", "mode", "dir_fd", NULL};
 
-	if(!PyArg_ParseTuple(args, "O&n:sortfile", hashset_module_filename, &filename_obj, &hashlen))
+	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "O&n|ii:sortfile", keywords,
+			hashset_module_filename, &filename_obj, &hashlen, &mode, &dirfd))
 		return NULL;
 
 	filename = PyBytes_AsString(filename_obj);
@@ -623,7 +639,7 @@ static PyObject *Hashset_sortfile(PyObject *class, PyObject *args) {
 		err.filename = filename;
 		Py_BEGIN_ALLOW_THREADS
 		if(hashlen >= HASHLEN_MIN) {
-			fd = open(filename, O_RDWR|O_NOCTTY|O_LARGEFILE|O_CLOEXEC);
+			fd = openat(dirfd, filename, O_RDWR|O_NOCTTY|O_LARGEFILE|O_CLOEXEC, mode);
 			if(fd != -1) {
 				if(fstat(fd, &st) != -1) {
 					if(st.st_size % hashlen == 0) {
@@ -721,9 +737,9 @@ static PyObject *Hashset_new(PyTypeObject *subtype, PyObject *args, PyObject *kw
 	return NULL;
 }
 
-static PyObject *Hashset_load(PyObject *class, PyObject *args) {
+static PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs) {
 	Hashset_t *hs = NULL;
-	int fd = -1;
+	int fd = -1, dirfd = AT_FDCWD;
 	struct stat st;
 	hashset_error_t err = hashset_error_0;
 
@@ -739,13 +755,14 @@ static PyObject *Hashset_load(PyObject *class, PyObject *args) {
 	hs->mapsize = 0;
 	hs->hashlen = 0;
 
-	if(PyArg_ParseTuple(args, "O&n:Hashset.load", hashset_module_filename, &hs->filename_obj, &hs->hashlen)) {
+	static char *keywords[] = {"", "", "dir_fd", NULL};
+	if(PyArg_ParseTupleAndKeywords(args, kwargs, "O&n|i:Hashset.load", keywords, hashset_module_filename, &hs->filename_obj, &hs->hashlen, &dirfd)) {
 		hs->filename = PyBytes_AsString(hs->filename_obj);
 		if(hs->filename) {
 			err.filename = hs->filename;
 			if(hs->hashlen >= HASHLEN_MIN) {
 				Py_BEGIN_ALLOW_THREADS
-				fd = open(hs->filename, O_RDONLY|O_NOCTTY|O_LARGEFILE|O_CLOEXEC);
+				fd = openat(dirfd, hs->filename, O_RDONLY|O_NOCTTY|O_LARGEFILE|O_CLOEXEC);
 				if(fd != -1) {
 					if(fstat(fd, &st) != -1) {
 						if(st.st_size) {
@@ -799,14 +816,22 @@ static PyObject *Hashset_load(PyObject *class, PyObject *args) {
 	}
 }
 
-static Py_ssize_t Hashset_length(Hashset_t *hs) {
+static Py_ssize_t Hashset_length(PyObject *self) {
+	Hashset_t *hs = Hashset_Check(self);
+	if(!hs)
+		return PyErr_SetString(PyExc_TypeError, "Hashset.__len__: self argument is not a valid Hashset object"), -1;
 	return hs->size / hs->hashlen;
 }
 
-static PyObject *Hashset_item(Hashset_t *hs, Py_ssize_t index) {
+static PyObject *Hashset_item(PyObject *self, Py_ssize_t index) {
 	uint64_t off;
 	char *buf;
 	PyObject *bytes;
+
+	Hashset_t *hs = Hashset_Check(self);
+	if(!hs)
+		return PyErr_SetString(PyExc_TypeError, "Hashset.__getitem__: self argument is not a valid Hashset object"), NULL;
+
 	Py_ssize_t hashlen = hs->hashlen;
 	Py_ssize_t len = hs->size / hashlen;
 
@@ -828,18 +853,22 @@ static PyObject *Hashset_item(Hashset_t *hs, Py_ssize_t index) {
 	return bytes;
 }
 
-static PyObject *Hashset_subscript(Hashset_t *hs, PyObject *key) {
+static PyObject *Hashset_subscript(PyObject *self, PyObject *key) {
 	uint64_t off = 0;
 	hashset_error_t err = hashset_error_0;
 	int d = 0;
 	Py_ssize_t index;
 	Py_buffer buf;
 
+	Hashset_t *hs = Hashset_Check(self);
+	if(!hs)
+		return PyErr_SetString(PyExc_TypeError, "Hashset.__getitem__: self argument is not a valid Hashset object"), NULL;
+
 	if(PyIndex_Check(key)) {
 		index = PyNumber_AsSsize_t(key, PyExc_IndexError);
 		if(index == -1 && PyErr_Occurred())
 			return NULL;
-		return Hashset_item(hs, index);
+		return Hashset_item(self, index);
 	}
 
 	if(!hs->size)
@@ -870,12 +899,16 @@ static PyObject *Hashset_subscript(Hashset_t *hs, PyObject *key) {
 		return PyLong_FromSize_t(off / hs->hashlen);
 }
 
-static int Hashset_contains(Hashset_t *hs, PyObject *key) {
+static int Hashset_contains(PyObject *self, PyObject *key) {
 	uint64_t off = 0;
 	hashset_error_t err = hashset_error_0;
 	int d = 0;
 	Py_ssize_t index;
 	Py_buffer buf;
+
+	Hashset_t *hs = Hashset_Check(self);
+	if(!hs)
+		return PyErr_SetString(PyExc_TypeError, "Hashset.__contains__: self argument is not a valid Hashset object"), -1;
 
 	if(!hs->size)
 		return 0;
@@ -909,38 +942,46 @@ static int Hashset_contains(Hashset_t *hs, PyObject *key) {
 	return !d;
 }
 
-static PyObject *Hashset_iter(Hashset_t *self) {
+static PyObject *Hashset_iter(PyObject *self) {
 	HashsetIterator_t *c;
+
+	Hashset_t *hs = Hashset_Check(self);
+	if(!hs)
+		return PyErr_SetString(PyExc_TypeError, "Hashset.__iter__: self argument is not a valid Hashset object"), NULL;
 
 	c = PyObject_New(HashsetIterator_t, &HashsetIterator_type);
 	if(!c)
 		return NULL;
 
 	c->magic = HASHSET_ITERATOR_MAGIC;
-	c->hs = self;
+	c->hs = hs;
 	c->off = 0;
 
-	Py_IncRef(&self->ob_base);
+	Py_IncRef(&hs->ob_base);
 
 	return &c->ob_base;
 }
 
-static PyObject *Hashset_iterate(Hashset_t *self, PyObject *args) {
+static PyObject *Hashset_iterate(PyObject *self, PyObject *args) {
 	HashsetIterator_t *c;
 	const char *key = NULL;
 	Py_ssize_t len;
 	size_t off = 0;
 	hashset_error_t err = hashset_error_0;
 
-	if(!PyArg_ParseTuple(args, "|y#:Hashset.exists", &key, &len))
+	Hashset_t *hs = Hashset_Check(self);
+	if(!hs)
+		return PyErr_SetString(PyExc_TypeError, "Hashset.__iter__: self argument is not a valid Hashset object"), NULL;
+
+	if(!PyArg_ParseTuple(args, "|y#:Hashset.iterate", &key, &len))
 		return NULL;
 
 	if(key) {
 		Py_BEGIN_ALLOW_THREADS
-		off = exists_ge(self, key, len, &err);
+		off = exists_ge(hs, key, len, &err);
 		Py_END_ALLOW_THREADS
 		if(err.type != HASHSET_ERROR_NONE) {
-			err.filename = self->filename;
+			err.filename = hs->filename;
 			hashset_error_to_python("iterator", &err);
 			return NULL;
 		}
@@ -951,10 +992,10 @@ static PyObject *Hashset_iterate(Hashset_t *self, PyObject *args) {
 		return NULL;
 
 	c->magic = HASHSET_ITERATOR_MAGIC;
-	c->hs = self;
+	c->hs = hs;
 	c->off = off;
 
-	Py_IncRef(&self->ob_base);
+	Py_IncRef(&hs->ob_base);
 
 	return &c->ob_base;
 }
@@ -969,12 +1010,12 @@ static PyObject *Hashset_none(PyObject *self, PyObject *args) {
 }
 
 static PyMethodDef Hashset_methods[] = {
-	{"sortfile", Hashset_sortfile, METH_VARARGS|METH_STATIC, "sort the hashes in a file"},
-	{"merge", Hashset_merge, METH_VARARGS|METH_STATIC, "merge Hashsets into a file"},
-	{"load", Hashset_load, METH_VARARGS|METH_STATIC, "load a Hashset from a file"},
-	{"iterate", (PyCFunction)Hashset_iterate, METH_VARARGS, "sort the hashes in a file"},
+	{"sortfile", (PyCFunction)Hashset_sortfile, METH_VARARGS|METH_KEYWORDS|METH_STATIC, "sort the hashes in a file"},
+	{"merge", (PyCFunction)Hashset_merge, METH_VARARGS|METH_KEYWORDS|METH_STATIC, "merge Hashsets into a file"},
+	{"load", (PyCFunction)Hashset_load, METH_VARARGS|METH_KEYWORDS|METH_STATIC, "load a Hashset from a file"},
+	{"iterate", (PyCFunction)Hashset_iterate, METH_VARARGS, "iterate over the hashes from a starting point"},
 	{"__enter__", (PyCFunction)Hashset_self, METH_NOARGS, "return a context manager for 'with'"},
-	{"__exit__", (PyCFunction)Hashset_none, METH_VARARGS, "callback for 'with' context manager"},
+	{"__exit__", Hashset_none, METH_VARARGS, "callback for 'with' context manager"},
 	{NULL}
 };
 
@@ -1002,37 +1043,45 @@ static PyTypeObject Hashset_type = {
 	.tp_as_sequence = &Hashset_as_sequence,
 };
 
-static PyObject *HashsetIterator_iternext(HashsetIterator_t *self) {
+static PyObject *HashsetIterator_iternext(PyObject *self) {
 	Hashset_t *hs;
 	size_t off;
 	char *buf;
 	PyObject *bytes;
 
-	hs = self->hs;
+	HashsetIterator_t *hsi = HashsetIterator_Check(self);
+	if(!hsi)
+		return PyErr_SetString(PyExc_TypeError, "HashsetIterator.__iternext__: self argument is not a valid HashsetIterator object"), NULL;
 
-	off = self->off;
+	hs = hsi->hs;
+
+	off = hsi->off;
 	if(off >= hs->size)
 		return NULL;
 
-	self->off = off + hs->hashlen;
+	hsi->off = off + hs->hashlen;
 
 	bytes = PyBytes_FromStringAndSize(NULL, hs->hashlen);
 	if(!bytes)
 		return NULL;
 	buf = PyBytes_AsString(bytes);
 
-	Py_BEGIN_ALLOW_THREADS
+	//Py_BEGIN_ALLOW_THREADS
 	memcpy(buf, hs->buf + off, hs->hashlen);
-	Py_END_ALLOW_THREADS
+	//Py_END_ALLOW_THREADS
 
 	return bytes;
 }
 
-static int HashsetIterator_dealloc(HashsetIterator_t *obj) {
-	Py_CLEAR(obj->hs);
+static int HashsetIterator_dealloc(PyObject *self) {
+	HashsetIterator_t *hsi = HashsetIterator_Check(self);
+	if(hsi) {
+		hsi->magic = 0;
+		Py_CLEAR(hsi->hs);
+	}
 
-	freefunc tp_free = Py_TYPE(obj)->tp_free ?: PyObject_Free;
-	tp_free(obj);
+	freefunc tp_free = Py_TYPE(self)->tp_free ?: PyObject_Free;
+	tp_free(self);
 
 	return 0;
 }
