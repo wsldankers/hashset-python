@@ -97,13 +97,6 @@ typedef struct hashset_error {
 static const hashset_error_t hashset_error_0 = {0, {0}, HASHSET_ERROR_NONE};
 
 #define HASHLEN_MIN ((Py_ssize_t)8)
-
-#ifdef WITH_THREAD
-#define DECLARE_THREAD_SAVE PyThreadState *_save;
-#else
-#define DECLARE_THREAD_SAVE
-#endif
-
 #define MERGEBUFSIZE (1 << 21)
 
 static void hashset_error_to_python(const char *function, hashset_error_t *err) {

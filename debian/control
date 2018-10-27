@@ -4,7 +4,7 @@ Priority: extra
 Maintainer: Wessel Dankers <wsl@fruit.je>
 Build-Depends: debhelper (>= 7), dh-python, python3-dev
 Standards-Version: 3.7.2
-X-Python3-Version: >= 3.4
+X-Python3-Version: >= 3.5
 
 Package: python3-hashset
 Architecture: any
@@ -15,5 +15,3 @@ Description: Create, merge and query sorted binary hashes
  hashes (such as SHA256).
  Functions are also provided to sort files (in place) and merge pre-sorted
  files efficiently.
- .
- This package provides python3 bindings for the library.

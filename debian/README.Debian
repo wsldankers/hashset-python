@@ -1,6 +1,6 @@
 hashset-python
 --------------
 
-Python 3 bindings for the hashset library.
+Python 3 module for fast lookups in sorted hash files.
 
  -- Wessel Dankers <wsl@fruit.je>  Tue, 23 Aug 2016 16:46:30 +0200
