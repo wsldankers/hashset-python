@@ -1,6 +1,6 @@
 Source: hashset-python
 Section: python
-Priority: extra
+Priority: optional
 Maintainer: Wessel Dankers <wsl@fruit.je>
 Build-Depends: debhelper (>= 7), dh-python, python3-dev
 Standards-Version: 3.7.2
@@ -8,7 +8,7 @@ X-Python3-Version: >= 3.5
 
 Package: python3-hashset
 Architecture: any
-Depends: ${python:Depends}, ${shlibs:Depends}
+Depends: ${python3:Depends}, ${shlibs:Depends}
 Description: Create, merge and query sorted binary hashes
  Provides a fast lookup function to query if a hash is in a given file
  (or memory buffer) assuming it contains a pre-sorted concatenated set of
