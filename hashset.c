@@ -598,9 +598,10 @@ static int Hashset_dealloc(PyObject *self) {
 	Hashset_t *hs = Hashset_Check(self);
 	if(hs) {
 		hs->magic = 0;
-		if(hs->buf != MAP_FAILED)
+		if(hs->buf != MAP_FAILED) {
 			munmap(hs->buf, hs->mapsize);
-		hs->buf = MAP_FAILED;
+			hs->buf = MAP_FAILED;
+		}
 
 		hs->filename = NULL;
 		Py_CLEAR(hs->filename_obj);
@@ -704,7 +705,7 @@ static PyObject *Hashset_new(PyTypeObject *subtype, PyObject *args, PyObject *kw
 	if(!hs)
 		return NULL;
 
-	hs->magic = HASHSET_MAGIC;
+	hs->magic = 0;
 	hs->buf = MAP_FAILED;
 	hs->filename = NULL;
 	hs->filename_obj = NULL;
@@ -716,18 +717,17 @@ static PyObject *Hashset_new(PyTypeObject *subtype, PyObject *args, PyObject *kw
 		hs->buf = mmap(NULL, (size_t)len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 		if(hs->buf == MAP_FAILED) {
 			PyErr_SetFromErrno(PyExc_OSError);
-		} else {
-			hs->size = hs->mapsize = len;
-			memcpy(hs->buf, bytes, len);
-			qsort_lr(hs->buf, len / hashlen, hashlen, (qsort_lr_cmp)memcmp, NULL);
-			dedup(hs);
-			return &hs->ob_base;
+			Py_DecRef(&hs->ob_base);
+			return NULL;
 		}
+		hs->size = hs->mapsize = len;
+		memcpy(hs->buf, bytes, len);
+		qsort_lr(hs->buf, len / hashlen, hashlen, (qsort_lr_cmp)memcmp, NULL);
+		dedup(hs);
 	}
 
-	Py_DecRef(&hs->ob_base);
-
-	return NULL;
+	hs->magic = HASHSET_MAGIC;
+	return &hs->ob_base;
 }
 
 static PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs) {
