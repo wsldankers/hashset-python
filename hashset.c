@@ -52,6 +52,7 @@ typedef struct hash_merge_source {
 	size_t end;
 	Hashset_t *hs;
 } hash_merge_source_t;
+__attribute__((unused))
 static const hash_merge_source_t hash_merge_source_0;
 
 typedef struct hash_merge_state {
@@ -649,8 +650,18 @@ static PyObject *Hashset_sortfile(PyObject *class, PyObject *args, PyObject *kwa
 									hashset_record_errno(&err, errno);
 								if(munmap(hs.buf, hs.mapsize) == -1)
 									hashset_record_errno(&err, errno);
-								if(err.type == HASHSET_ERROR_NONE && hs.size != hs.mapsize && ftruncate(fd, hs.size) == -1)
-									hashset_record_errno(&err, errno);
+
+								if(err.type == HASHSET_ERROR_NONE) {
+									if(hs.size == hs.mapsize) {
+										if(fdatasync(fd) == -1)
+											hashset_record_errno(&err, errno);
+									} else {
+										if(ftruncate(fd, hs.size) == -1)
+											hashset_record_errno(&err, errno);
+										if(fsync(fd) == -1)
+											hashset_record_errno(&err, errno);
+									}
+								}
 							} else {
 								hashset_record_errno(&err, errno);
 							}
