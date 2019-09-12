@@ -636,8 +636,8 @@ static PyObject *Hashset_sortfile(PyObject *class, PyObject *args, PyObject *kwa
 			fd = openat(dirfd, filename, O_RDWR|O_NOCTTY|O_LARGEFILE|O_CLOEXEC, mode);
 			if(fd != -1) {
 				if(fstat(fd, &st) != -1) {
-					if(st.st_size % hashlen == 0) {
-						if(st.st_size) {
+					if(st.st_size) {
+						if(st.st_size % hashlen == 0) {
 							hs.buf = mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
 							if(hs.buf != MAP_FAILED) {
 								hs.size = hs.mapsize = st.st_size;
@@ -655,10 +655,8 @@ static PyObject *Hashset_sortfile(PyObject *class, PyObject *args, PyObject *kwa
 								hashset_record_errno(&err, errno);
 							}
 						} else {
-							hashset_record_errno(&err, errno);
+							hashset_record_hashlen_error(&err, st.st_size, hashlen);
 						}
-					} else {
-						hashset_record_hashlen_error(&err, st.st_size, hashlen);
 					}
 				} else {
 					hashset_record_errno(&err, errno);
