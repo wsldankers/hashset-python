@@ -18,7 +18,7 @@ Description: Create, merge and query sorted binary hashes
 
 Package: python3-hashset-dbg
 Architecture: any
-Depends: ${python3:Depends}, ${shlibs:Depends}, ${misc:Depends}
+Depends: ${python3:Depends}, ${shlibs:Depends}, ${misc:Depends}, python3-hashset (= ${binary:Version})
 Description: Create, merge and query sorted binary hashes
  Provides a fast lookup function to query if a hash is in a given file
  (or memory buffer) assuming it contains a pre-sorted concatenated set of
