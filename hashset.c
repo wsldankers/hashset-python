@@ -769,7 +769,7 @@ static PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs)
 					if(fstat(fd, &st) != -1) {
 						if(st.st_size) {
 							if(st.st_size % hs->hashlen == 0) {
-								hs->buf = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+								hs->buf = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
 								if(hs->buf != MAP_FAILED) {
 									hs->mapsize = hs->size = st.st_size;
 									if(close(fd) != -1)
