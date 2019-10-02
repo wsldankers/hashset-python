@@ -158,19 +158,22 @@ static inline HashsetIterator_t *HashsetIterator_Check(PyObject *v) {
 
 static int hashset_module_filename(PyObject *filename_object, PyObject **dst) {
 	if(filename_object) {
-		if(PyUnicode_Check(filename_object)) {
-			return PyUnicode_FSConverter(filename_object, dst);
-		} else if(PyBytes_Check(filename_object)) {
+		if(PyLong_Check(filename_object) || PyBytes_Check(filename_object)) {
 			Py_IncRef(filename_object);
 			*dst = filename_object;
+		} else if(PyUnicode_Check(filename_object)) {
+			return PyUnicode_FSConverter(filename_object, dst);
 		} else {
-			*dst = PyBytes_FromObject(filename_object);
+			PyObject *obj = PyBytes_FromObject(filename_object);
+			if(!obj)
+				return 0;
+			*dst = obj;
 		}
 	} else if(dst) {
 		Py_CLEAR(*dst);
-		return true;
+		return 1;
 	} else {
-		return false;
+		return 0;
 	}
 	return Py_CLEANUP_SUPPORTED;
 }
@@ -419,12 +422,12 @@ static void safewrite(hash_merge_state_t *state, hashset_error_t *err) {
 	return hashset_clear_error(err);
 }
 
+
 static void merge_do(hash_merge_state_t *state, hashset_error_t *err) {
 	size_t i;
 	Hashset_t *hs;
 	hash_merge_source_t *src;
 	char *last;
-	int fd;
 	size_t hashlen = state->hashlen;
 
 	if(state->numsources) {
@@ -438,10 +441,6 @@ static void merge_do(hash_merge_state_t *state, hashset_error_t *err) {
 		if(state->buf == MAP_FAILED)
 			return hashset_record_errno(err, errno);
 	}
-
-	fd = state->fd = openat(state->dirfd, state->filename, O_WRONLY|O_CREAT|O_NOCTTY|O_LARGEFILE|O_CLOEXEC, state->mode);
-	if(fd == -1)
-		return hashset_record_errno(err, errno);
 
 	if(state->numsources) {
 		state->queue = malloc(state->numsources * sizeof *state->queue);
@@ -502,23 +501,31 @@ static void merge_do(hash_merge_state_t *state, hashset_error_t *err) {
 		}
 	}
 
+	return hashset_clear_error(err);
+}
+
+static void merge_do_file(hash_merge_state_t *state, hashset_error_t *err) {
+	int fd = state->fd = openat(state->dirfd, state->filename, O_WRONLY|O_CREAT|O_NOCTTY|O_LARGEFILE|O_CLOEXEC, state->mode);
+	if(fd == -1)
+		return hashset_record_errno(err, errno);
+
+	merge_do(state, err);
+
 	if(ftruncate(fd, state->written) == -1)
 		return hashset_record_errno(err, errno);
 
-	if(fdatasync(fd) == -1)
+	if(fsync(fd) == -1)
 		return hashset_record_errno(err, errno);
 
 	state->fd = -1;
-	if(close(fd) == -1)
+	if(close(fd) == -1 && err->type == HASHSET_ERROR_NONE)
 		return hashset_record_errno(err, errno);
-
-	return hashset_clear_error(err);
 }
 
 static void merge_cleanup(hash_merge_state_t *state) {
 	free(state->sources);
 	free(state->queue);
-	if(state->fd != -1)
+	if(state->fd != -1 && state->filename)
 		close(state->fd);
 	if(state->buf != MAP_FAILED)
 		munmap(state->buf, MERGEBUFSIZE);
@@ -532,9 +539,9 @@ static PyObject *Hashset_merge(PyObject *class, PyObject *args, PyObject *kwargs
 		return PyErr_SetString(PyExc_SystemError, "Hashset.merge: new style getargs format but argument is not a tuple"), NULL;
 
 	hash_merge_state_t state = hash_merge_state_0;
-	state.numsources = PyTuple_GET_SIZE(args);
+	state.numsources = PyTuple_Size(args);
 	if(state.numsources < 0)
-		return PyErr_SetString(PyExc_TypeError, "Hashset.merge: needs at least 1 argument (0 given)"), NULL;
+		return NULL;
 
 	static char *keywords[] = {"path", "mode", "dir_fd", NULL};
 	PyObject *empty_tuple = PyTuple_New(0);
@@ -547,9 +554,25 @@ static PyObject *Hashset_merge(PyObject *class, PyObject *args, PyObject *kwargs
 		return NULL;
 
 	hashset_error_t err = hashset_error_0;
-	state.filename = PyBytes_AsString(state.filename_obj);
-	if(state.filename) {
-		err.filename = state.filename;
+	if(PyLong_Check(state.filename_obj)) {
+		long fd = PyLong_AsLong(state.filename_obj);
+		if(fd == -1 && PyErr_Occurred()) {
+			hashset_record_python_error(&err);
+		} else if(fd > INT_MAX || fd < 0) {
+			PyErr_Format(PyExc_ValueError, "Hashset.merge: argument %ld is not a valid file descriptor", fd);
+			hashset_record_python_error(&err);
+		}
+		state.fd = fd;
+	} else {
+		state.filename = PyBytes_AsString(state.filename_obj);
+		if(state.filename) {
+			err.filename = state.filename;
+		} else {
+			hashset_record_python_error(&err);
+		}
+	}
+
+	if(err.type == HASHSET_ERROR_NONE) {
 		state.sources = malloc(state.numsources * sizeof *state.sources);
 		if(state.sources) {
 			int i;
@@ -575,7 +598,10 @@ static PyObject *Hashset_merge(PyObject *class, PyObject *args, PyObject *kwargs
 
 			if(i == state.numsources) {
 				Py_BEGIN_ALLOW_THREADS
-				merge_do(&state, &err);
+				if(state.filename)
+					merge_do_file(&state, &err);
+				else
+					merge_do(&state, &err);
 				Py_END_ALLOW_THREADS
 				hashset_error_to_python("merge", &err);
 			}
@@ -583,8 +609,6 @@ static PyObject *Hashset_merge(PyObject *class, PyObject *args, PyObject *kwargs
 			hashset_record_python_error(&err);
 			PyErr_NoMemory();
 		}
-	} else {
-		hashset_record_python_error(&err);
 	}
 
 	merge_cleanup(&state);
@@ -629,13 +653,32 @@ static PyObject *Hashset_sortfile(PyObject *class, PyObject *args, PyObject *kwa
 			hashset_module_filename, &filename_obj, &hashlen, &mode, &dirfd))
 		return NULL;
 
-	filename = PyBytes_AsString(filename_obj);
-	if(filename) {
-		err.filename = filename;
+	if(PyLong_Check(filename_obj)) {
+		long l = PyLong_AsLong(filename_obj);
+		if(l == -1 && PyErr_Occurred()) {
+			hashset_record_python_error(&err);
+		} else if(l > INT_MAX || l < 0) {
+			PyErr_Format(PyExc_ValueError, "Hashset.merge: argument %ld is not a valid file descriptor", l);
+			hashset_record_python_error(&err);
+		}
+		fd = l;
+	} else {
+		filename = PyBytes_AsString(filename_obj);
+		if(filename)
+			err.filename = filename;
+		else
+			hashset_record_python_error(&err);
+	}
+
+	if(err.type == HASHSET_ERROR_NONE) {
 		Py_BEGIN_ALLOW_THREADS
 		if(hashlen >= HASHLEN_MIN) {
-			fd = openat(dirfd, filename, O_RDWR|O_NOCTTY|O_LARGEFILE|O_CLOEXEC, mode);
-			if(fd != -1) {
+			if(filename) {
+				fd = openat(dirfd, filename, O_RDWR|O_NOCTTY|O_LARGEFILE|O_CLOEXEC, mode);
+				if(fd == -1)
+					hashset_record_errno(&err, errno);
+			}
+			if(err.type == HASHSET_ERROR_NONE) {
 				if(fstat(fd, &st) != -1) {
 					if(st.st_size) {
 						if(st.st_size % hashlen == 0) {
@@ -669,10 +712,8 @@ static PyObject *Hashset_sortfile(PyObject *class, PyObject *args, PyObject *kwa
 							hashset_record_hashlen_error(&err, st.st_size, hashlen);
 						}
 					}
-				} else {
-					hashset_record_errno(&err, errno);
 				}
-				if(close(fd) == -1 && err.type == HASHSET_ERROR_NONE)
+				if(filename && close(fd) == -1 && err.type == HASHSET_ERROR_NONE)
 					hashset_record_errno(&err, errno);
 			} else {
 				hashset_record_errno(&err, errno);
@@ -682,7 +723,6 @@ static PyObject *Hashset_sortfile(PyObject *class, PyObject *args, PyObject *kwa
 		}
 		Py_END_ALLOW_THREADS
 		hashset_error_to_python("sortfile", &err);
-		err.filename = NULL;
 	} else {
 		hashset_record_python_error(&err);
 	}
@@ -758,24 +798,47 @@ static PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs)
 	hs->hashlen = 0;
 
 	static char *keywords[] = {"", "", "dir_fd", NULL};
-	if(PyArg_ParseTupleAndKeywords(args, kwargs, "O&n|i:Hashset.load", keywords, hashset_module_filename, &hs->filename_obj, &hs->hashlen, &dirfd)) {
-		hs->filename = PyBytes_AsString(hs->filename_obj);
-		if(hs->filename) {
-			err.filename = hs->filename;
+	if(PyArg_ParseTupleAndKeywords(args, kwargs, "O&n|i:Hashset.load", keywords,
+			hashset_module_filename, &hs->filename_obj, &hs->hashlen, &dirfd)) {
+
+		if(PyLong_Check(hs->filename_obj)) {
+			long l = PyLong_AsLong(hs->filename_obj);
+			if(l == -1 && PyErr_Occurred()) {
+				hashset_record_python_error(&err);
+			} else if(l > INT_MAX || l < 0) {
+				PyErr_Format(PyExc_ValueError, "Hashset.load: argument %ld is not a valid file descriptor", l);
+				hashset_record_python_error(&err);
+			}
+			fd = l;
+		} else {
+			hs->filename = PyBytes_AsString(hs->filename_obj);
+			if(hs->filename)
+				err.filename = hs->filename;
+			else
+				hashset_record_python_error(&err);
+		}
+
+		if(err.type == HASHSET_ERROR_NONE) {
 			if(hs->hashlen >= HASHLEN_MIN) {
 				Py_BEGIN_ALLOW_THREADS
-				fd = openat(dirfd, hs->filename, O_RDONLY|O_NOCTTY|O_LARGEFILE|O_CLOEXEC);
-				if(fd != -1) {
+
+				if(hs->filename) {
+					fd = openat(dirfd, hs->filename, O_RDONLY|O_NOCTTY|O_LARGEFILE|O_CLOEXEC);
+					if(fd == -1)
+						hashset_record_errno(&err, errno);
+				}
+
+				if(err.type == HASHSET_ERROR_NONE) {
 					if(fstat(fd, &st) != -1) {
 						if(st.st_size) {
 							if(st.st_size % hs->hashlen == 0) {
 								hs->buf = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
 								if(hs->buf != MAP_FAILED) {
 									hs->mapsize = hs->size = st.st_size;
-									if(close(fd) != -1)
-										madvise(hs->buf, st.st_size, MADV_WILLNEED);
-									else
+									if(hs->filename && close(fd) == -1)
 										hashset_record_errno(&err, errno);
+									else
+										madvise(hs->buf, st.st_size, MADV_WILLNEED);
 									fd = -1;
 								} else {
 									hashset_record_errno(&err, errno);
@@ -784,14 +847,14 @@ static PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs)
 								hashset_record_hashlen_error(&err, st.st_size, hs->hashlen);
 							}
 						} else {
-							if(close(fd) == -1)
+							if(hs->filename && close(fd) == -1)
 								hashset_record_errno(&err, errno);
 							fd = -1;
 						}
 					} else {
 						hashset_record_errno(&err, errno);
 					}
-					if(fd != -1)
+					if(hs->filename && fd != -1)
 						close(fd);
 				} else {
 					hashset_record_errno(&err, errno);
