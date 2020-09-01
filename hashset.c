@@ -1,4 +1,7 @@
-#define _LARGEFILE64_SOURCE 1
+#define PY_SSIZE_T_CLEAN
+
+#include "Python.h"
+#include "pythread.h"
 
 #include <fcntl.h>
 #include <errno.h>
@@ -8,11 +11,6 @@
 #include <stdint.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-
-#define PY_SSIZE_T_CLEAN
-
-#include "Python.h"
-#include "pythread.h"
 
 #ifdef WITH_THREAD
 #define DECLARE_THREAD_SAVE PyThreadState *_save;
@@ -247,7 +245,7 @@ static void dedup(Hashset_t *hs) {
 		src += hashlen;
 	}
 
-	hs->size = dst - buf;
+	hs->size = (size_t)(dst - buf);
 
 	return;
 }
@@ -287,7 +285,7 @@ static uint64_t exists_ge(const Hashset_t *hs, const void *key, size_t len, hash
 	int d;
 
 	if(len != hs->hashlen)
-		return hashset_record_hashlen_error(err, len, hs->hashlen), 0;
+		return hashset_record_hashlen_error(err, (Py_ssize_t)len, (Py_ssize_t)hs->hashlen), UINT64_C(0);
 
 	upper = hs->size / len;
 	if(!upper)
