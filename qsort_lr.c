@@ -93,6 +93,8 @@ typedef struct {
 		stack size is needed (actually O(1) in this case)! */
 
 void qsort_lr(void *const pbase, size_t total_elems, size_t size,
+		int (*cmp)(const void *, const void *, size_t, void *), void *arg);
+void qsort_lr(void *const pbase, size_t total_elems, size_t size,
 		int (*cmp)(const void *, const void *, size_t, void *), void *arg) {
 	char *base_ptr = (char *)pbase;
 
@@ -120,7 +122,7 @@ void qsort_lr(void *const pbase, size_t total_elems, size_t size,
 			 skips a comparison for both the LEFT_PTR and RIGHT_PTR in
 			 the while loops. */
 
-			char *mid = lo + size * ((hi - lo) / size >> 1);
+			char *mid = lo + size * ((size_t)(hi - lo) / size >> 1);
 
 			if(cmp((void *)mid, (void *)lo, size, arg) < 0)
 				memswap(mid, lo, size);

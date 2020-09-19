@@ -28,7 +28,7 @@ extern void qsort_lr(void *const pbase, size_t total_elems, size_t size, qsort_l
 typedef struct Hashset {
 	PyObject_HEAD
 	uint64_t magic;
-	void *buf;
+	char *buf;
 	char *filename;
 	PyObject *filename_obj;
 	size_t size;
@@ -193,19 +193,18 @@ static bool hashset_module_object_to_buffer(PyObject *obj, Py_buffer *buffer) {
 	return true;
 }
 
-static uint64_t msb64(const uint8_t *bytes, size_t len) {
+static uint64_t msb64(const char *bytes, size_t len) {
 	uint8_t buf[8];
 	size_t i;
 	if(len < 8) {
 		for(i = 0; i < 8; i++)
-			buf[i] = bytes[i % len];
-		bytes = buf;
+			buf[i] = ((const uint8_t *)bytes)[i % len];
 	}
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-	return *(const uint64_t *)bytes;
+	return *(const uint64_t *)buf;
 #elif __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #ifdef __GNUC__
-	return __builtin_bswap64(*(const uint64_t *)bytes);
+	return __builtin_bswap64(*(const uint64_t *)buf);
 #else
 	uint64_t r = *(const uint64_t *)bytes;
 	r = ((r & UINT64_C(0x00FF00FF00FF00FF)) << 8) | ((r & UINT64_C(0xFF00FF00FF00FF00)) >> 8);
@@ -213,24 +212,24 @@ static uint64_t msb64(const uint8_t *bytes, size_t len) {
 	return (r << 32) | (r >> 32);
 #endif
 #else
-	return ((uint64_t)bytes[0] << 56)
-		| ((uint64_t)bytes[1] << 48)
-		| ((uint64_t)bytes[2] << 40)
-		| ((uint64_t)bytes[3] << 32)
-		| ((uint64_t)bytes[4] << 24)
-		| ((uint64_t)bytes[5] << 16)
-		| ((uint64_t)bytes[6] << 8)
-		| ((uint64_t)bytes[7]);
+	return ((uint64_t)buf[0] << 56)
+		| ((uint64_t)buf[1] << 48)
+		| ((uint64_t)buf[2] << 40)
+		| ((uint64_t)buf[3] << 32)
+		| ((uint64_t)buf[4] << 24)
+		| ((uint64_t)buf[5] << 16)
+		| ((uint64_t)buf[6] << 8)
+		| ((uint64_t)buf[7]);
 #endif
 }
 
 static void dedup(Hashset_t *hs) {
 	size_t hashlen = hs->hashlen;
-	uint8_t *buf = hs->buf;
-	uint8_t *dst = buf + hashlen;
-	const uint8_t *prv = buf;
-	const uint8_t *src = buf + hashlen;
-	const uint8_t *end = buf + hs->size;
+	char *buf = hs->buf;
+	char *dst = buf + hashlen;
+	const char *prv = buf;
+	const char *src = buf + hashlen;
+	const char *end = buf + hs->size;
 
 	if(!hs->size)
 		return;
@@ -251,7 +250,7 @@ static void dedup(Hashset_t *hs) {
 }
 
 static uint64_t guess(uint64_t lower, uint64_t upper, uint64_t lower_hash, uint64_t upper_hash, uint64_t target) {
-#ifdef __SIZEOF_INT128__
+#ifdef X__SIZEOF_INT128__
 	unsigned __int128 res, diff;
 	uint64_t num, off, ret;
 	num = upper - lower;
@@ -280,7 +279,7 @@ static uint64_t guess(uint64_t lower, uint64_t upper, uint64_t lower_hash, uint6
 }
 
 static uint64_t exists_ge(const Hashset_t *hs, const void *key, size_t len, hashset_error_t *err) {
-	const uint8_t *buf, *cur_buf;
+	const char *buf, *cur_buf;
 	uint64_t lower, upper, cur, lower_hash, upper_hash, target;
 	int d;
 
@@ -289,7 +288,7 @@ static uint64_t exists_ge(const Hashset_t *hs, const void *key, size_t len, hash
 
 	upper = hs->size / len;
 	if(!upper)
-		return err->type = HASHSET_ERROR_NONE, 0;
+		return err->type = HASHSET_ERROR_NONE, UINT64_C(0);
 
 	buf = hs->buf;
 	lower = 0;
@@ -409,15 +408,17 @@ static void safewrite(hash_merge_state_t *state, hashset_error_t *err) {
 		r = write(state->fd, buf, state->fill);
 		switch(r) {
 			case -1:
-				return hashset_record_errno(err, errno);
+				hashset_record_errno(err, errno);
+				return;
 			case 0:
-				return hashset_record_errno(err, EAGAIN);
+				hashset_record_errno(err, EAGAIN);
+				return;
 		}
 		buf += (size_t)r;
 		state->fill -= (size_t)r;
-		state->written += (size_t)r;
+		state->written += (off_t)r;
 	}
-	return hashset_clear_error(err);
+	hashset_clear_error(err);
 }
 
 
@@ -429,21 +430,27 @@ static void merge_do(hash_merge_state_t *state, hashset_error_t *err) {
 	size_t hashlen = state->hashlen;
 
 	if(state->numsources) {
-		if(MERGEBUFSIZE % hashlen)
-			return hashset_record_hashlen_error(err, MERGEBUFSIZE, hashlen);
+		if(MERGEBUFSIZE % hashlen) {
+			hashset_record_hashlen_error(err, MERGEBUFSIZE, (Py_ssize_t)hashlen);
+			return;
+		}
 #ifdef MAP_HUGETLB
 		state->buf = mmap(NULL, MERGEBUFSIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
 		if(state->buf == MAP_FAILED)
 #endif
 		state->buf = mmap(NULL, MERGEBUFSIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-		if(state->buf == MAP_FAILED)
-			return hashset_record_errno(err, errno);
+		if(state->buf == MAP_FAILED) {
+			hashset_record_errno(err, errno);
+			return;
+		}
 	}
 
 	if(state->numsources) {
 		state->queue = malloc(state->numsources * sizeof *state->queue);
-		if(!state->queue)
-			return hashset_record_errno(err, errno);
+		if(!state->queue) {
+			hashset_record_errno(err, errno);
+			return;
+		}
 
 		for(i = 0; i < state->numsources; i++) {
 			src = state->sources + i;
@@ -499,25 +506,31 @@ static void merge_do(hash_merge_state_t *state, hashset_error_t *err) {
 		}
 	}
 
-	return hashset_clear_error(err);
+	hashset_clear_error(err);
 }
 
 static void merge_do_file(hash_merge_state_t *state, hashset_error_t *err) {
 	int fd = state->fd = openat(state->dirfd, state->filename, O_WRONLY|O_CREAT|O_NOCTTY|O_LARGEFILE|O_CLOEXEC, state->mode);
-	if(fd == -1)
-		return hashset_record_errno(err, errno);
+	if(fd == -1) {
+		hashset_record_errno(err, errno);
+		return;
+	}
 
 	merge_do(state, err);
 
-	if(ftruncate(fd, state->written) == -1)
-		return hashset_record_errno(err, errno);
+	if(ftruncate(fd, state->written) == -1) {
+		hashset_record_errno(err, errno);
+		return;
+	}
 
-	if(fsync(fd) == -1)
-		return hashset_record_errno(err, errno);
+	if(fsync(fd) == -1) {
+		hashset_record_errno(err, errno);
+		return;
+	}
 
 	state->fd = -1;
 	if(close(fd) == -1 && err->type == HASHSET_ERROR_NONE)
-		return hashset_record_errno(err, errno);
+		hashset_record_errno(err, errno);
 }
 
 static void merge_cleanup(hash_merge_state_t *state) {
@@ -537,11 +550,15 @@ static PyObject *Hashset_merge(PyObject *class, PyObject *args, PyObject *kwargs
 		return PyErr_SetString(PyExc_SystemError, "Hashset.merge: new style getargs format but argument is not a tuple"), NULL;
 
 	hash_merge_state_t state = hash_merge_state_0;
-	state.numsources = PyTuple_Size(args);
-	if(state.numsources < 0)
+	Py_ssize_t num_args = PyTuple_Size(args);
+	if(num_args < 0)
 		return NULL;
+	state.numsources = (size_t)num_args;
 
-	static char *keywords[] = {"path", "mode", "dir_fd", NULL};
+	char keyword_path[] = "path";
+	char keyword_mode[] = "mode";
+	char keyword_dir_fd[] = "dir_fd";
+	char *keywords[] = {keyword_path, keyword_mode, keyword_dir_fd, NULL};
 	PyObject *empty_tuple = PyTuple_New(0);
 	if(!empty_tuple)
 		return NULL;
@@ -560,20 +577,19 @@ static PyObject *Hashset_merge(PyObject *class, PyObject *args, PyObject *kwargs
 			PyErr_Format(PyExc_ValueError, "Hashset.merge: argument %ld is not a valid file descriptor", fd);
 			hashset_record_python_error(&err);
 		}
-		state.fd = fd;
+		state.fd = (int)fd;
 	} else {
 		state.filename = PyBytes_AsString(state.filename_obj);
-		if(state.filename) {
+		if(state.filename)
 			err.filename = state.filename;
-		} else {
+		else
 			hashset_record_python_error(&err);
-		}
 	}
 
 	if(err.type == HASHSET_ERROR_NONE) {
 		state.sources = malloc(state.numsources * sizeof *state.sources);
 		if(state.sources) {
-			int i;
+			size_t i;
 			for(i = 0; i < state.numsources; i++) {
 				Hashset_t *hs = Hashset_Check(PyTuple_GET_ITEM(args, i));
 				if(!hs) {
@@ -617,7 +633,7 @@ static PyObject *Hashset_merge(PyObject *class, PyObject *args, PyObject *kwargs
 		return NULL;
 }
 
-static int Hashset_dealloc(PyObject *self) {
+static void Hashset_dealloc(PyObject *self) {
 	Hashset_t *hs = Hashset_Check(self);
 	if(hs) {
 		hs->magic = 0;
@@ -630,10 +646,14 @@ static int Hashset_dealloc(PyObject *self) {
 		Py_CLEAR(hs->filename_obj);
 	}
 
-	freefunc tp_free = Py_TYPE(self)->tp_free ?: PyObject_Free;
+	freefunc tp_free = Py_TYPE(self)->tp_free;
+	if(!tp_free)
+		tp_free = PyObject_Free;
 	tp_free(self);
+}
 
-	return 0;
+static int memcmp_lr(const void *a, const void *b, size_t len,  void *userdata) {
+	return memcmp(a, b, len);
 }
 
 static PyObject *Hashset_sortfile(PyObject *class, PyObject *args, PyObject *kwargs) {
@@ -645,7 +665,11 @@ static PyObject *Hashset_sortfile(PyObject *class, PyObject *args, PyObject *kwa
 	Py_ssize_t hashlen;
 	char *filename;
 	hashset_error_t err = hashset_error_0;
-	static char *keywords[] = {"", "", "mode", "dir_fd", NULL};
+
+	char keyword_[] = "";
+	char keyword_mode[] = "mode";
+	char keyword_dir_fd[] = "dir_fd";
+	char *keywords[] = {keyword_, keyword_, keyword_mode, keyword_dir_fd, NULL};
 
 	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "O&n|ii:sortfile", keywords,
 			hashset_module_filename, &filename_obj, &hashlen, &mode, &dirfd))
@@ -659,7 +683,7 @@ static PyObject *Hashset_sortfile(PyObject *class, PyObject *args, PyObject *kwa
 			PyErr_Format(PyExc_ValueError, "Hashset.merge: argument %ld is not a valid file descriptor", l);
 			hashset_record_python_error(&err);
 		}
-		fd = l;
+		fd = (int)l;
 	} else {
 		filename = PyBytes_AsString(filename_obj);
 		if(filename)
@@ -679,35 +703,41 @@ static PyObject *Hashset_sortfile(PyObject *class, PyObject *args, PyObject *kwa
 			if(err.type == HASHSET_ERROR_NONE) {
 				if(fstat(fd, &st) != -1) {
 					if(st.st_size) {
-						if(st.st_size % hashlen == 0) {
-							hs.buf = mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-							if(hs.buf != MAP_FAILED) {
-								hs.size = hs.mapsize = st.st_size;
-								hs.hashlen = hashlen;
-								qsort_lr(hs.buf, hs.size / hashlen, hashlen, (qsort_lr_cmp)memcmp, NULL);
-								dedup(&hs);
+						if(st.st_size <= (off_t)PY_SSIZE_T_MAX) {
+							size_t size = (size_t)st.st_size;
+							if(size % (size_t)hashlen == 0) {
+								hs.buf = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+								if(hs.buf != MAP_FAILED) {
+									hs.size = hs.mapsize = size;
+									hs.hashlen = (size_t)hashlen;
+									qsort_lr(hs.buf, hs.size / hs.hashlen, hs.hashlen, memcmp_lr, NULL);
+									dedup(&hs);
 
-								if(msync(hs.buf, hs.mapsize, MS_SYNC) == -1)
-									hashset_record_errno(&err, errno);
-								if(munmap(hs.buf, hs.mapsize) == -1)
-									hashset_record_errno(&err, errno);
+									if(msync(hs.buf, hs.size, MS_SYNC) == -1)
+										hashset_record_errno(&err, errno);
+									if(munmap(hs.buf, hs.mapsize) == -1)
+										hashset_record_errno(&err, errno);
 
-								if(err.type == HASHSET_ERROR_NONE) {
-									if(hs.size == hs.mapsize) {
-										if(fdatasync(fd) == -1)
-											hashset_record_errno(&err, errno);
-									} else {
-										if(ftruncate(fd, hs.size) == -1)
-											hashset_record_errno(&err, errno);
-										if(fsync(fd) == -1)
-											hashset_record_errno(&err, errno);
+									if(err.type == HASHSET_ERROR_NONE) {
+										if(hs.size == hs.mapsize) {
+											if(fdatasync(fd) == -1)
+												hashset_record_errno(&err, errno);
+										} else {
+											if(ftruncate(fd, (off_t)hs.size) == -1)
+												hashset_record_errno(&err, errno);
+											if(fsync(fd) == -1)
+												hashset_record_errno(&err, errno);
+										}
 									}
+								} else {
+									hashset_record_errno(&err, errno);
 								}
 							} else {
-								hashset_record_errno(&err, errno);
+								hashset_record_hashlen_error(&err, (Py_ssize_t)size, hashlen);
 							}
 						} else {
-							hashset_record_hashlen_error(&err, st.st_size, hashlen);
+							PyErr_Format(PyExc_ValueError, "Hashset.merge: file %s is too large", filename);
+							hashset_record_python_error(&err);
 						}
 					}
 				}
@@ -767,9 +797,9 @@ static PyObject *Hashset_new(PyTypeObject *subtype, PyObject *args, PyObject *kw
 			Py_DecRef(&hs->ob_base);
 			return NULL;
 		}
-		hs->size = hs->mapsize = len;
-		memcpy(hs->buf, bytes, len);
-		qsort_lr(hs->buf, len / hashlen, hashlen, (qsort_lr_cmp)memcmp, NULL);
+		hs->size = hs->mapsize = (size_t)len;
+		memcpy(hs->buf, bytes, (size_t)len);
+		qsort_lr(hs->buf, (size_t)(len / hashlen), (size_t)hashlen, memcmp_lr, NULL);
 		dedup(hs);
 	}
 
@@ -795,7 +825,9 @@ static PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs)
 	hs->mapsize = 0;
 	hs->hashlen = 0;
 
-	static char *keywords[] = {"", "", "dir_fd", NULL};
+	char keyword_[] = "";
+	char keyword_dir_fd[] = "dir_fd";
+	char *keywords[] = {keyword_, keyword_, keyword_dir_fd, NULL};
 	if(PyArg_ParseTupleAndKeywords(args, kwargs, "O&n|i:Hashset.load", keywords,
 			hashset_module_filename, &hs->filename_obj, &hs->hashlen, &dirfd)) {
 
@@ -807,7 +839,7 @@ static PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs)
 				PyErr_Format(PyExc_ValueError, "Hashset.load: argument %ld is not a valid file descriptor", l);
 				hashset_record_python_error(&err);
 			}
-			fd = l;
+			fd = (int)l;
 		} else {
 			hs->filename = PyBytes_AsString(hs->filename_obj);
 			if(hs->filename)
@@ -829,20 +861,26 @@ static PyObject *Hashset_load(PyObject *class, PyObject *args, PyObject *kwargs)
 				if(err.type == HASHSET_ERROR_NONE) {
 					if(fstat(fd, &st) != -1) {
 						if(st.st_size) {
-							if(st.st_size % hs->hashlen == 0) {
-								hs->buf = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-								if(hs->buf != MAP_FAILED) {
-									hs->mapsize = hs->size = st.st_size;
-									if(hs->filename && close(fd) == -1)
+							if(st.st_size <= (off_t)PY_SSIZE_T_MAX) {
+								size_t size = (size_t)st.st_size;
+								if(size % hs->hashlen == 0) {
+									hs->buf = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+									if(hs->buf != MAP_FAILED) {
+										hs->mapsize = hs->size = size;
+										if(hs->filename && close(fd) == -1)
+											hashset_record_errno(&err, errno);
+										else
+											madvise(hs->buf, size, MADV_WILLNEED);
+										fd = -1;
+									} else {
 										hashset_record_errno(&err, errno);
-									else
-										madvise(hs->buf, st.st_size, MADV_WILLNEED);
-									fd = -1;
+									}
 								} else {
-									hashset_record_errno(&err, errno);
+									hashset_record_hashlen_error(&err, (Py_ssize_t)size, (Py_ssize_t)hs->hashlen);
 								}
 							} else {
-								hashset_record_hashlen_error(&err, st.st_size, hs->hashlen);
+								PyErr_Format(PyExc_ValueError, "Hashset.load: file %s is too large", hs->filename);
+								hashset_record_python_error(&err);
 							}
 						} else {
 							if(hs->filename && close(fd) == -1)
@@ -883,7 +921,7 @@ static Py_ssize_t Hashset_length(PyObject *self) {
 	Hashset_t *hs = Hashset_Check(self);
 	if(!hs)
 		return PyErr_SetString(PyExc_TypeError, "Hashset.__len__: self argument is not a valid Hashset object"), -1;
-	return hs->size / hs->hashlen;
+	return (Py_ssize_t)(hs->size / hs->hashlen);
 }
 
 static PyObject *Hashset_item(PyObject *self, Py_ssize_t index) {
@@ -895,14 +933,14 @@ static PyObject *Hashset_item(PyObject *self, Py_ssize_t index) {
 	if(!hs)
 		return PyErr_SetString(PyExc_TypeError, "Hashset.__getitem__: self argument is not a valid Hashset object"), NULL;
 
-	Py_ssize_t hashlen = hs->hashlen;
-	Py_ssize_t len = hs->size / hashlen;
+	Py_ssize_t hashlen = (Py_ssize_t)hs->hashlen;
+	Py_ssize_t len = (Py_ssize_t)hs->size / hashlen;
 
 	if(index < 0)
 		index += len;
 	if(index < 0 || index >= len)
 		return PyErr_SetString(PyExc_IndexError, "index out of range"), NULL;
-	off = index * hashlen;
+	off = (uint64_t)(index * hashlen);
 
 	bytes = PyBytes_FromStringAndSize(NULL, hashlen);
 	if(!bytes)
@@ -910,7 +948,7 @@ static PyObject *Hashset_item(PyObject *self, Py_ssize_t index) {
 	buf = PyBytes_AsString(bytes);
 
 	Py_BEGIN_ALLOW_THREADS
-	memcpy(buf, hs->buf + off, hashlen);
+	memcpy(buf, hs->buf + off, (size_t)hashlen);
 	Py_END_ALLOW_THREADS
 
 	return bytes;
@@ -941,9 +979,9 @@ static PyObject *Hashset_subscript(PyObject *self, PyObject *key) {
 		return NULL;
 
 	Py_BEGIN_ALLOW_THREADS
-	off = exists_ge(hs, buf.buf, buf.len, &err);
+	off = exists_ge(hs, buf.buf, (size_t)buf.len, &err);
 	if(err.type == HASHSET_ERROR_NONE)
-		d = memcmp((const char *)hs->buf + off, buf.buf, buf.len);
+		d = memcmp(hs->buf + off, buf.buf, (size_t)buf.len);
 	Py_END_ALLOW_THREADS
 
 	PyBuffer_Release(&buf);
@@ -980,16 +1018,16 @@ static int Hashset_contains(PyObject *self, PyObject *key) {
 		index = PyNumber_AsSsize_t(key, PyExc_IndexError);
 		if(index == -1 && PyErr_Occurred())
 			return -1;
-		return index >= 0 && index < hs->size / hs->hashlen;
+		return index >= 0 && (size_t)index < hs->size / hs->hashlen;
 	}
 
 	if(!hashset_module_object_to_buffer(key, &buf))
 		return -1;
 
 	Py_BEGIN_ALLOW_THREADS
-	off = exists_ge(hs, buf.buf, buf.len, &err);
+	off = exists_ge(hs, buf.buf, (size_t)buf.len, &err);
 	if(err.type == HASHSET_ERROR_NONE)
-		d = memcmp((const char *)hs->buf + off, buf.buf, buf.len);
+		d = memcmp(hs->buf + off, buf.buf, (size_t)buf.len);
 	Py_END_ALLOW_THREADS
 
 	PyBuffer_Release(&buf);
@@ -1041,7 +1079,7 @@ static PyObject *Hashset_iterate(PyObject *self, PyObject *args) {
 
 	if(key) {
 		Py_BEGIN_ALLOW_THREADS
-		off = exists_ge(hs, key, len, &err);
+		off = exists_ge(hs, key, (size_t)len, &err);
 		Py_END_ALLOW_THREADS
 		if(err.type != HASHSET_ERROR_NONE) {
 			err.filename = hs->filename;
@@ -1076,21 +1114,21 @@ static PyMethodDef Hashset_methods[] = {
 	{"sortfile", (PyCFunction)Hashset_sortfile, METH_VARARGS|METH_KEYWORDS|METH_STATIC, "sort the hashes in a file"},
 	{"merge", (PyCFunction)Hashset_merge, METH_VARARGS|METH_KEYWORDS|METH_STATIC, "merge Hashsets into a file"},
 	{"load", (PyCFunction)Hashset_load, METH_VARARGS|METH_KEYWORDS|METH_STATIC, "load a Hashset from a file"},
-	{"iterate", (PyCFunction)Hashset_iterate, METH_VARARGS, "iterate over the hashes from a starting point"},
-	{"__enter__", (PyCFunction)Hashset_self, METH_NOARGS, "return a context manager for 'with'"},
+	{"iterate", Hashset_iterate, METH_VARARGS, "iterate over the hashes from a starting point"},
+	{"__enter__", Hashset_self, METH_NOARGS, "return a context manager for 'with'"},
 	{"__exit__", Hashset_none, METH_VARARGS, "callback for 'with' context manager"},
 	{NULL}
 };
 
 static PySequenceMethods Hashset_as_sequence = {
-	.sq_contains = (objobjproc)Hashset_contains,
-	.sq_item = (ssizeargfunc)Hashset_item,
-	.sq_length = (lenfunc)Hashset_length,
+	.sq_contains = Hashset_contains,
+	.sq_item = Hashset_item,
+	.sq_length = Hashset_length,
 };
 
 static PyMappingMethods Hashset_as_mapping = {
-	.mp_subscript = (binaryfunc)Hashset_subscript,
-	.mp_length = (lenfunc)Hashset_length,
+	.mp_subscript = Hashset_subscript,
+	.mp_length = Hashset_length,
 };
 
 static PyTypeObject Hashset_type = {
@@ -1098,9 +1136,9 @@ static PyTypeObject Hashset_type = {
 	.tp_flags = Py_TPFLAGS_DEFAULT,
 	.tp_basicsize = sizeof(Hashset_t),
 	.tp_name = "hashset.Hashset",
-	.tp_new = (newfunc)Hashset_new,
-	.tp_dealloc = (destructor)Hashset_dealloc,
-	.tp_iter = (getiterfunc)Hashset_iter,
+	.tp_new = Hashset_new,
+	.tp_dealloc = Hashset_dealloc,
+	.tp_iter = Hashset_iter,
 	.tp_methods = Hashset_methods,
 	.tp_as_mapping = &Hashset_as_mapping,
 	.tp_as_sequence = &Hashset_as_sequence,
@@ -1124,7 +1162,7 @@ static PyObject *HashsetIterator_iternext(PyObject *self) {
 
 	hsi->off = off + hs->hashlen;
 
-	bytes = PyBytes_FromStringAndSize(NULL, hs->hashlen);
+	bytes = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)hs->hashlen);
 	if(!bytes)
 		return NULL;
 	buf = PyBytes_AsString(bytes);
@@ -1136,17 +1174,17 @@ static PyObject *HashsetIterator_iternext(PyObject *self) {
 	return bytes;
 }
 
-static int HashsetIterator_dealloc(PyObject *self) {
+static void HashsetIterator_dealloc(PyObject *self) {
 	HashsetIterator_t *hsi = HashsetIterator_Check(self);
 	if(hsi) {
 		hsi->magic = 0;
 		Py_CLEAR(hsi->hs);
 	}
 
-	freefunc tp_free = Py_TYPE(self)->tp_free ?: PyObject_Free;
+	freefunc tp_free = Py_TYPE(self)->tp_free;
+	if(!tp_free)
+		tp_free = PyObject_Free;
 	tp_free(self);
-
-	return 0;
 }
 
 static PyMethodDef HashsetIterator_methods[] = {
@@ -1160,7 +1198,7 @@ static PyTypeObject HashsetIterator_type = {
 	.tp_flags = Py_TPFLAGS_DEFAULT,
 	.tp_basicsize = sizeof(HashsetIterator_t),
 	.tp_name = "hashset.HashsetIterator",
-	.tp_dealloc = (destructor)HashsetIterator_dealloc,
+	.tp_dealloc = HashsetIterator_dealloc,
 	.tp_iter = PyObject_SelfIter,
 	.tp_iternext = (getiterfunc)HashsetIterator_iternext,
 	.tp_methods = HashsetIterator_methods,
@@ -1175,6 +1213,7 @@ static struct PyModuleDef hashset_module = {
 	.m_doc = hashset_module_doc,
 };
 
+PyMODINIT_FUNC PyInit_hashset(void);
 PyMODINIT_FUNC PyInit_hashset(void) {
 	if(PyType_Ready(&Hashset_type) == -1)
 		return NULL;
