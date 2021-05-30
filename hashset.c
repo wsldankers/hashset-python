@@ -259,7 +259,7 @@ static void dedup(Hashset_t *hs) {
 }
 
 static uint64_t guess(uint64_t lower, uint64_t upper, uint64_t lower_hash, uint64_t upper_hash, uint64_t target) {
-#ifdef X__SIZEOF_INT128__
+#ifdef __SIZEOF_INT128__
 	unsigned __int128 res, diff;
 	uint64_t num, off, ret;
 	num = upper - lower;
