@@ -194,32 +194,41 @@ static bool hashset_module_object_to_buffer(PyObject *obj, Py_buffer *buffer) {
 }
 
 static uint64_t msb64(const char *bytes, size_t len) {
-	uint8_t buf[8];
-	size_t i;
-	if(len < 8) {
-		for(i = 0; i < 8; i++)
-			buf[i] = ((const uint8_t *)bytes)[i % len];
+	union {
+		uint8_t buf[8];
+		uint64_t u64;
+	} u;
+	if(len < sizeof u.buf) {
+		if(!len)
+			return 0;
+		size_t i = 0, j = 0;
+		while(i < sizeof u.buf) {
+			u.buf[i++] = ((const uint8_t *)bytes)[j++];
+			if(j == len)
+				j = 0;
+		}
+	} else {
+		memcpy(u.buf, bytes, sizeof u.buf);
 	}
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-	return *(const uint64_t *)buf;
+	return u.u64;
 #elif __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #ifdef __GNUC__
-	return __builtin_bswap64(*(const uint64_t *)buf);
+	return __builtin_bswap64(u.u64);
 #else
-	uint64_t r = *(const uint64_t *)bytes;
-	r = ((r & UINT64_C(0x00FF00FF00FF00FF)) << 8) | ((r & UINT64_C(0xFF00FF00FF00FF00)) >> 8);
-	r = ((r & UINT64_C(0x0000FFFF0000FFFF)) << 16) | ((r & UINT64_C(0xFFFF0000FFFF0000)) >> 16);
-	return (r << 32) | (r >> 32);
+	u.u64 = ((u.u64 & UINT64_C(0x00FF00FF00FF00FF)) << 8) | ((u.u64 & UINT64_C(0xFF00FF00FF00FF00)) >> 8);
+	u.u64 = ((u.u64 & UINT64_C(0x0000FFFF0000FFFF)) << 16) | ((u.u64 & UINT64_C(0xFFFF0000FFFF0000)) >> 16);
+	return (u.u64 << 32) | (u.u64 >> 32);
 #endif
 #else
-	return ((uint64_t)buf[0] << 56)
-		| ((uint64_t)buf[1] << 48)
-		| ((uint64_t)buf[2] << 40)
-		| ((uint64_t)buf[3] << 32)
-		| ((uint64_t)buf[4] << 24)
-		| ((uint64_t)buf[5] << 16)
-		| ((uint64_t)buf[6] << 8)
-		| ((uint64_t)buf[7]);
+	return ((uint64_t)u.buf[0] << 56)
+		| ((uint64_t)u.buf[1] << 48)
+		| ((uint64_t)u.buf[2] << 40)
+		| ((uint64_t)u.buf[3] << 32)
+		| ((uint64_t)u.buf[4] << 24)
+		| ((uint64_t)u.buf[5] << 16)
+		| ((uint64_t)u.buf[6] << 8)
+		| ((uint64_t)u.buf[7]);
 #endif
 }
 
